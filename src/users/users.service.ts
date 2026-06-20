@@ -1,48 +1,68 @@
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
-import { prisma } from '../database/prisma.service';
+import { Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { DB } from '../database/database.module';
+import { NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { users } from '../database/schema';
+import { eq, ilike, or } from 'drizzle-orm';
 
 @Injectable()
 export class UsersService {
-  private readonly logger = new Logger(UsersService.name);
+  constructor(@Inject(DB) private db: NodePgDatabase) {}
 
   async findById(id: string) {
-    const user = await prisma.user.findUnique({
-      where: { id },
-      select: {
-        id: true, username: true, email: true, status: true,
-        isActive: true, keyVersion: true, createdAt: true, lastLoginAt: true,
-      },
-    });
+    const [user] = await this.db
+      .select({
+        id: users.id,
+        username: users.username,
+        email: users.email,
+        status: users.status,
+        isActive: users.isActive,
+        keyVersion: users.keyVersion,
+        createdAt: users.createdAt,
+        lastLoginAt: users.lastLoginAt,
+      })
+      .from(users)
+      .where(eq(users.id, id));
     if (!user) throw new NotFoundException('User not found');
     return user;
   }
 
   async findByUsername(username: string) {
-    return prisma.user.findUnique({
-      where: { username },
-      select: { id: true, username: true, email: true, status: true },
-    });
+    const [user] = await this.db
+      .select({
+        id: users.id,
+        username: users.username,
+        email: users.email,
+        status: users.status,
+      })
+      .from(users)
+      .where(eq(users.username, username));
+    return user ?? null;
   }
 
   async updateStatus(userId: string, status: string) {
-    return prisma.user.update({
-      where: { id: userId },
-      data: { status },
-      select: { id: true, status: true },
-    });
+    const [updated] = await this.db
+      .update(users)
+      .set({ status })
+      .where(eq(users.id, userId))
+      .returning({ id: users.id, status: users.status });
+    return updated;
   }
 
   async search(query: string, limit = 20) {
-    return prisma.user.findMany({
-      where: {
-        OR: [
-          { username: { contains: query, mode: 'insensitive' } },
-          { email: { contains: query, mode: 'insensitive' } },
-        ],
-        isActive: true,
-      },
-      select: { id: true, username: true, email: true, status: true },
-      take: limit,
-    });
+    return this.db
+      .select({
+        id: users.id,
+        username: users.username,
+        email: users.email,
+        status: users.status,
+      })
+      .from(users)
+      .where(
+        or(
+          ilike(users.username, `%${query}%`),
+          ilike(users.email, `%${query}%`),
+        ),
+      )
+      .limit(limit);
   }
 }

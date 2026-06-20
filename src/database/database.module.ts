@@ -1,14 +1,23 @@
 import { Module, Global } from '@nestjs/common';
-import { prisma } from './prisma.service';
+import { Pool } from 'pg';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from './schema';
+
+export const DB = 'DB_CONNECTION';
 
 @Global()
 @Module({
   providers: [
     {
-      provide: 'PRISMA',
-      useValue: prisma,
+      provide: DB,
+      useFactory: () => {
+        const pool = new Pool({
+          connectionString: process.env.DATABASE_URL!,
+        });
+        return drizzle(pool, { schema });
+      },
     },
   ],
-  exports: ['PRISMA'],
+  exports: [DB],
 })
 export class DatabaseModule {}
