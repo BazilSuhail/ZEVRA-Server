@@ -42,7 +42,7 @@ export class ConfigService implements OnModuleInit {
   get jwtExpiresIn(): string { return this.config['JWT_EXPIRES_IN'] || '15m'; }
   get jwtRefreshExpiresIn(): string { return this.config['JWT_REFRESH_EXPIRES_IN'] || '7d'; }
 
-  get supabaseUrl(): string { return this.config['VITE_SUPABASE_URL'] || ''; }
-  get supabaseAnonKey(): string { return this.config['VITE_SUPABASE_ANON_KEY'] || ''; }
+  get supabaseUrl(): string { return this.config['SUPABASE_URL'] || ''; }
+  get supabaseAnonKey(): string { return this.config['SUPABASE_ANON_KEY'] || ''; }
   get supabaseServiceKey(): string { return this.config['SUPABASE_SERVICE_ROLE_KEY'] || ''; }
 }

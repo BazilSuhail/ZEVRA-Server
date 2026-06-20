@@ -3,6 +3,7 @@ import { ConfigModule } from '../config/config.module';
 import { CryptoModule } from '../crypto/crypto.module';
 import { SharedModule } from '../shared/shared.module';
 import { JwtModule } from '@nestjs/jwt';
+import { UsersModule } from '../users/users.module';
 
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
@@ -12,10 +13,11 @@ import { AuthService } from './auth.service';
     ConfigModule,
     CryptoModule,
     SharedModule,
+    UsersModule,
     JwtModule.register({
       global: true,
-      secret: process.env.JWT_SECRET!,
-      signOptions: { expiresIn: process.env.JWT_EXPIRES_IN! },
+      secret: process.env.JWT_SECRET,
+      signOptions: { expiresIn: process.env.JWT_EXPIRES_IN },
     }),
   ],
   controllers: [AuthController],
