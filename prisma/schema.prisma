@@ -1,0 +1,121 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            String      @id @default(uuid()) @db.Uuid
+  username      String      @unique @db.VarChar(32)
+  email         String      @unique @db.VarChar(255)
+  passwordHash  String      @map("password_hash") @db.VarChar(255)
+  srpSalt       String      @map("srp_salt") @db.VarChar(64)
+  srpVerifier   String?     @map("srp_verifier")
+  argon2Mem     Int         @default(65536) @map("argon2_mem")
+  argon2Time    Int         @default(3) @map("argon2_time")
+  argon2Par     Int         @default(4) @map("argon2_par")
+  status        String      @default("OFFLINE")
+  isActive      Boolean     @default(true) @map("is_active")
+  keyVersion    Int?        @map("key_version")
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+  lastLoginAt   DateTime?   @map("last_login_at")
+
+  memberships   Membership[]
+  sentMessages  Message[]        @relation("Sender")
+  refreshTokens RefreshToken[]
+  deviceKeys    DeviceKey[]
+  senderKeys    SenderKey[]      @relation("KeyOwner")
+
+  @@map("users")
+}
+
+model Channel {
+  id          String      @id @default(uuid()) @db.Uuid
+  name        String?     @db.VarChar(64)
+  type        String      @default("DIRECT")
+  isArchived  Boolean     @default(false) @map("is_archived")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  memberships Membership[]
+  messages    Message[]
+
+  @@map("channels")
+}
+
+model Membership {
+  id        String     @id @default(uuid()) @db.Uuid
+  role      String     @default("MEMBER")
+  joinedAt  DateTime   @default(now()) @map("joined_at")
+  muted     Boolean    @default(false)
+
+  userId    String     @map("user_id") @db.Uuid
+  channelId String     @map("channel_id") @db.Uuid
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channelId])
+  @@map("memberships")
+}
+
+model Message {
+  id          String      @id @default(uuid()) @db.Uuid
+  content     String
+  type        String      @default("TEXT")
+  isDeleted   Boolean     @default(false) @map("is_deleted")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  senderId    String      @map("sender_id") @db.Uuid
+  channelId   String      @map("channel_id") @db.Uuid
+  sender      User        @relation("Sender", fields: [senderId], references: [id], onDelete: Cascade)
+  channel     Channel     @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, createdAt])
+  @@map("messages")
+}
+
+model DeviceKey {
+  id          String   @id @default(uuid()) @db.Uuid
+  deviceId    String   @map("device_id") @db.VarChar(64)
+  publicKey   String   @map("public_key")
+  keyType     String   @default("x25519") @map("key_type") @db.VarChar(16)
+  createdAt   DateTime @default(now()) @map("created_at")
+  isActive    Boolean  @default(true) @map("is_active")
+
+  userId      String   @map("user_id") @db.Uuid
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@map("device_keys")
+}
+
+model SenderKey {
+  id           String   @id @default(uuid()) @db.Uuid
+  groupId      String   @map("group_id") @db.Uuid
+  epoch        Int      @default(0)
+  encryptedKey String   @map("encrypted_key")
+  keySignature String   @map("key_signature")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  ownerId      String   @map("owner_id") @db.Uuid
+  owner        User     @relation("KeyOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, ownerId, epoch])
+  @@map("sender_keys")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  token     String   @unique
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("refresh_tokens")
+}

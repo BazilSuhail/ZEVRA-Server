@@ -1,9 +1,8 @@
 import { Module } from '@nestjs/common';
-import { EnumsService } from '../shared/enums.service';
-import { ExceptionsService } from '../shared/exceptions.service';
+import { HttpExceptionFilter } from './exception.filter';
 
 @Module({
-  providers: [EnumsService, ExceptionsService],
-  exports: [EnumsService, ExceptionsService],
+  providers: [HttpExceptionFilter],
+  exports: [HttpExceptionFilter],
 })
 export class CommonModule {}

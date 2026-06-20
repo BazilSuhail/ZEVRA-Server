@@ -1,112 +1,126 @@
-import { Injectable, UnauthorizedException, InternalServerErrorException } from '@nestjs/common';
-import { ConfigService } from '../config/config.service';
+import { Injectable, UnauthorizedException, ConflictException, Logger } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { prisma } from '../database/prisma.service';
 import { CryptoService } from '../crypto/crypto.service';
-import { User } from '../users/entities/user.entity';
 
 @Injectable()
 export class AuthService {
-  // Constructor no longer needs repository injection
-  // We'll use direct DB queries or skip user lookup for now
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
-    private configService: ConfigService,
-    private cryptoService: CryptoService,
+    private crypto: CryptoService,
+    private jwt: JwtService,
   ) {}
 
   async register(username: string, email: string, password: string) {
-    // Check if user exists - skip DB check for now
-    // In production, would query the database
+    const existing = await prisma.user.findFirst({
+      where: { OR: [{ username }, { email }] },
+    });
+    if (existing) {
+      throw new ConflictException(
+        existing.username === username ? 'Username already taken' : 'Email already registered',
+      );
+    }
 
-    // Generate SRP salt (16 bytes = 128 bits) using crypto service
-    const srpSalt = this.cryptoService.getRandomBytes(16);
-    const srpSaltHex = Buffer.from(srpSalt).toString('hex');
+    const passwordHash = await this.crypto.hashPassword(password);
+    const srpSalt = this.crypto.generateSrpSalt();
+    const srpVerifier = this.crypto.computeSrpVerifier(password, srpSalt);
 
-    // Generate Argon2id salt for KEK derivation (32 bytes)
-    const argon2Salt = this.cryptoService.getRandomBytes(32);
-    const argon2SaltBuf = Buffer.from(argon2Salt);
+    const user = await prisma.user.create({
+      data: { username, email, passwordHash, srpSalt, srpVerifier },
+      select: { id: true, username: true, email: true, createdAt: true },
+    });
 
-    // Derive x = Argon2id(password, argon2_salt) using crypto service
-    const x = await this.cryptoService.hashPassword(password, argon2SaltBuf);
-
-    // Compute SRP verifier v = g^x mod N
-    const srpVerifier = this.cryptoService['computeVerifier']
-      ? await this.cryptoService['computeVerifier'](Buffer.from(x, 'hex'), srpSalt)
-      : this.computeVerifier(Buffer.from(x, 'hex'), srpSalt);
-
-    // Return registration result (placeholder user data)
-    return {
-      user: {
-        id: 'placeholder-uuid',
-        username,
-        email,
-      },
-      needsSrpVerification: true,
-    };
-  }
-
-  private computeVerifier(x: Buffer, srpSalt: Buffer): Buffer {
-    // Simplified SRP verifier computation
-    // v = g^x mod N
-    // In production, use proper bigint arithmetic (BN.js or similar)
-    const crypto = require('crypto');
-    const hash = crypto.createHash('sha256').update(x).update(srpSalt).digest();
-    const result = Buffer.alloc(128);
-    hash.copy(result);
-    return result;
+    this.logger.log(`User registered: ${user.username}`);
+    return { user };
   }
 
   async loginStart(username: string) {
-    // Return server ephemeral B and srp_salt for client
-    const B = this.computeServerEphemeral();
-    return {
-      userId: 'placeholder-user',
-      username: username,
-      srpSalt: 'placeholder-srp-salt',
-      B,
-    };
+    const user = await prisma.user.findUnique({ where: { username } });
+    if (!user) throw new UnauthorizedException('User not found');
+
+    const B = this.crypto.getRandomHex(32);
+    return { userId: user.id, username: user.username, srpSalt: user.srpSalt, B };
   }
 
-  async loginFinish(body: {
-    username: string;
-    A: string;
-    M1: string;
-    password: string;
-  }) {
-    // Validate the SRP M1 proof
-    const isValid = await this.validateSrpM1(body.M1);
-    if (!isValid) {
-      throw new UnauthorizedException('SRP validation failed - invalid M1');
+  async loginFinish(body: { username: string; A: string; M1: string }) {
+    const user = await prisma.user.findUnique({ where: { username: body.username } });
+    if (!user) throw new UnauthorizedException('User not found');
+
+    const tokens = await this.issueTokens(user.id);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lastLoginAt: new Date(), status: 'ONLINE' },
+    });
+
+    this.logger.log(`User logged in: ${user.username}`);
+    return { user: { id: user.id, username: user.username, email: user.email }, ...tokens };
+  }
+
+  async validateUser(username: string, password: string) {
+    const user = await prisma.user.findUnique({ where: { username } });
+    if (!user) return null;
+
+    const valid = await this.crypto.comparePassword(password, user.passwordHash);
+    if (!valid) return null;
+
+    return { id: user.id, username: user.username, email: user.email };
+  }
+
+  async loginLocal(user: { id: string; username: string; email: string }) {
+    const tokens = await this.issueTokens(user.id);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lastLoginAt: new Date(), status: 'ONLINE' },
+    });
+
+    return { user, ...tokens };
+  }
+
+  async issueTokens(userId: string) {
+    const payload = { sub: userId };
+    const accessToken = await this.jwt.signAsync(payload);
+    const refreshToken = this.crypto.getRandomHex(32);
+
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
+
+    await prisma.refreshToken.create({
+      data: { token: refreshToken, userId, expiresAt },
+    });
+
+    return { accessToken, refreshToken };
+  }
+
+  async refreshTokens(refreshToken: string) {
+    const record = await prisma.refreshToken.findUnique({
+      where: { token: refreshToken },
+    });
+    if (!record || record.expiresAt < new Date()) {
+      throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
-    // Compute session key and issue JWT
-    const jwtSecret = this.configService.jwtSecret;
-    const jwtToken = this.signJwt('placeholder-user', jwtSecret);
+    await prisma.refreshToken.delete({ where: { id: record.id } });
+    return this.issueTokens(record.userId);
+  }
 
-    return {
-      user: {
-        id: 'placeholder-user',
-        username: body.username,
+  async getProfile(userId: string) {
+    return prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true, username: true, email: true, status: true,
+        createdAt: true, lastLoginAt: true, keyVersion: true,
       },
-      accessToken: jwtToken,
-      needsKeyDerivation: true,
-    };
+    });
   }
 
-  private async validateSrpM1(M1: string): Promise<boolean> {
-    return M1.length === 64; // 256-bit hash
-  }
-
-  private computeServerEphemeral(): string {
-    const crypto = require('crypto');
-    const b = crypto.randomBytes(32).toString('hex');
-    return b;
-  }
-
-  private signJwt(userId: string, secret: string): string {
-    return `jwt.${userId}.signature`;
-  }
-
-  async validateUser(username: string, password: string): Promise<boolean> {
-    // Placeholder - always return true for now
-    return true;
+  async logout(userId: string) {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { status: 'OFFLINE' },
+    });
+    await prisma.refreshToken.deleteMany({ where: { userId } });
   }
 }

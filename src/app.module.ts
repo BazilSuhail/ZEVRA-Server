@@ -1,43 +1,27 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from './config/config.module';
-import { CryptoModule } from './crypto/crypto.module';
-import { SharedModule } from './shared/shared.module';
-import { UsersModule } from './users/users.module';
-import { TypeOrmModule } from '@nestjs/typeorm';
+import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
-
-import { AppService } from './app.service';
+import { DatabaseModule } from './database/database.module';
+import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
+import { CommonModule } from './common/common.module';
 import { AppController } from './app.controller';
-
-import { DisplayService } from './config/display';
+import { AppService } from './app.service';
 
 @Module({
   imports: [
-    ConfigModule,
-    CryptoModule,
-    SharedModule,
-    UsersModule,
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: 'db.postgres.supabase.com',
-      port: 5432,
-      username: 'postgres',
-      password: process.env.SUPABASE_ANON_KEY || 'postgres',
-      database: 'postgres',
-      synchronize: false,
-      logging: true,
-      ssl: {
-        rejectUnauthorized: false,
-      },
-      entities: [__dirname + '/users/entities/*.entity{.ts,.js}'],
-    }),
+    ConfigModule.forRoot({ isGlobal: true }),
+    DatabaseModule,
     JwtModule.register({
       global: true,
       secret: process.env.JWT_SECRET,
-      signOptions: { expiresIn: process.env.JWT_EXPIRES_IN },
+      signOptions: { expiresIn: '15m' },
     }),
+    AuthModule,
+    UsersModule,
+    CommonModule,
   ],
   controllers: [AppController],
-  providers: [AppService, DisplayService],
+  providers: [AppService],
 })
 export class AppModule {}
