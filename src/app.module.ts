@@ -7,6 +7,7 @@ import { UsersModule } from './users/users.module';
 import { CommonModule } from './common/common.module';
 import { MessagesModule } from './messages/messages.module';
 import { ChannelsModule } from './channels/channels.module';
+import { KeysModule } from './keys/keys.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -24,6 +25,7 @@ import { AppService } from './app.service';
     CommonModule,
     MessagesModule,
     ChannelsModule,
+    KeysModule,
   ],
   controllers: [AppController],
   providers: [AppService],
