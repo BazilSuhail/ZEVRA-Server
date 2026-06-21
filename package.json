@@ -19,6 +19,7 @@
     "@nestjs/jwt": "^11.0.2",
     "@nestjs/passport": "^11.0.5",
     "@nestjs/platform-express": "^11.2.1",
+    "@supabase/supabase-js": "^2.112.4",
     "argon2": "^0.45.1",
     "bullmq": "^6.2.0",
     "class-transformer": "^0.5.1",

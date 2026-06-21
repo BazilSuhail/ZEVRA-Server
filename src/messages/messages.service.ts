@@ -1,12 +1,16 @@
 import { Inject, Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { messages, memberships, channels, messageReads } from '../database/schema';
+import { messages, memberships, channels, messageReads, users } from '../database/schema';
 import { eq, and, lt, desc, sql, count } from 'drizzle-orm';
+import { RealtimeService } from '../realtime/realtime.service';
 
 @Injectable()
 export class MessagesService {
-  constructor(@Inject(DB) private db: NodePgDatabase) {}
+  constructor(
+    @Inject(DB) private db: NodePgDatabase,
+    private realtime: RealtimeService,
+  ) {}
 
   async send(params: {
     userId: string;
@@ -95,6 +99,21 @@ export class MessagesService {
           eq(memberships.channelId, params.channelId),
         ),
       );
+
+    // 6. Broadcast to channel subscribers
+    this.realtime.broadcastMessage(params.channelId, {
+      id: msg.id,
+      senderId: params.userId,
+      channelId: params.channelId,
+      encryptedContent: params.encryptedContent,
+      contentIv: params.contentIv,
+      contentTag: params.contentTag,
+      signature: params.signature,
+      sequenceNumber: params.sequenceNumber,
+      senderKeyEpoch: params.senderKeyEpoch,
+      messageType: params.messageType ?? 'TEXT',
+      createdAt: msg.createdAt,
+    });
 
     return msg;
   }
@@ -230,6 +249,9 @@ export class MessagesService {
           eq(memberships.channelId, channelId),
         ),
       );
+
+    // Broadcast read receipt
+    this.realtime.broadcastReadReceipt(channelId, userId, messageId);
 
     return { success: true };
   }

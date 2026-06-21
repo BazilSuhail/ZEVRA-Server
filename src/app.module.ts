@@ -12,6 +12,7 @@ import { KeysModule } from './keys/keys.module';
 import { QueuesModule } from './queues/queues.module';
 import { PresenceModule } from './presence/presence.module';
 import { TypingModule } from './typing/typing.module';
+import { RealtimeModule } from './realtime/realtime.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -34,6 +35,7 @@ import { AppService } from './app.service';
     QueuesModule,
     PresenceModule,
     TypingModule,
+    RealtimeModule,
   ],
   controllers: [AppController],
   providers: [AppService],
