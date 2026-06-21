@@ -1,5 +1,5 @@
 import { Module, Global } from '@nestjs/common';
-import Redis from 'ioredis';
+import { createClient } from 'redis';
 
 export const REDIS = 'REDIS_CONNECTION';
 
@@ -8,11 +8,21 @@ export const REDIS = 'REDIS_CONNECTION';
   providers: [
     {
       provide: REDIS,
-      useFactory: () => {
-        return new Redis(process.env.REDIS_URL ?? 'redis://127.0.0.1:6379', {
-          maxRetriesPerRequest: null,
-          enableReadyCheck: false,
+      useFactory: async () => {
+        const url = process.env.REDIS_URL;
+        if (!url) {
+          console.warn('[Redis] REDIS_URL missing — Redis features disabled');
+          return null;
+        }
+
+        const client = createClient({ url });
+
+        client.on('error', () => {
+          console.warn('[Redis] Connection error — Redis features disabled');
         });
+
+        await client.connect();
+        return client;
       },
     },
   ],

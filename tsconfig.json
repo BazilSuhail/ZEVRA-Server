@@ -17,7 +17,7 @@
       "*": ["./*"]
     },
     "incremental": true,
-    "types": ["jest", "node"],
+    "types": ["node"],
     "skipLibCheck": true,
     "strictNullChecks": true,
     "forceConsistentCasingInFileNames": true,

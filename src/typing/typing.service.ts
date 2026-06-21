@@ -1,65 +1,59 @@
-import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { REDIS } from '../redis/redis.module';
-import Redis from 'ioredis';
 
 @Injectable()
-export class TypingService implements OnModuleDestroy {
+export class TypingService {
   private readonly logger = new Logger(TypingService.name);
   private readonly PREFIX = 'typing:';
   private readonly TTL_SECONDS = 5;
-  private subscriber: Redis;
-  private channels = new Map<string, Set<(data: any) => void>>();
 
-  constructor(@Inject(REDIS) private redis: Redis) {
-    this.subscriber = this.redis.duplicate();
-  }
+  constructor(@Inject(REDIS) private redis: any) {}
 
   async startTyping(userId: string, channelId: string, username: string) {
-    await this.redis.set(
-      `${this.PREFIX}${channelId}:${userId}`,
-      username,
-      'EX',
-      this.TTL_SECONDS,
-    );
+    if (!this.redis) return;
+    try {
+      await this.redis.setEx(
+        `${this.PREFIX}${channelId}:${userId}`,
+        this.TTL_SECONDS,
+        username,
+      );
+    } catch {}
   }
 
   async stopTyping(userId: string, channelId: string) {
-    await this.redis.del(`${this.PREFIX}${channelId}:${userId}`);
+    if (!this.redis) return;
+    try {
+      await this.redis.del(`${this.PREFIX}${channelId}:${userId}`);
+    } catch {}
   }
 
   async getTypingUsers(channelId: string): Promise<{ userId: string; username: string }[]> {
-    const pattern = `${this.PREFIX}${channelId}:*`;
-    const keys: string[] = [];
+    if (!this.redis) return [];
 
-    let cursor = '0';
-    do {
-      const [nextCursor, batch] = await this.redis.scan(
-        cursor,
-        'MATCH',
-        pattern,
-        'COUNT',
-        100,
-      );
-      cursor = nextCursor;
-      keys.push(...batch);
-    } while (cursor !== '0');
+    try {
+      const pattern = `${this.PREFIX}${channelId}:*`;
+      const keys: string[] = [];
 
-    const pipeline = this.redis.pipeline();
-    for (const key of keys) {
-      pipeline.get(key);
+      let cursor = '0';
+      do {
+        const result = await this.redis.scan(Number(cursor), {
+          MATCH: pattern,
+          COUNT: 100,
+        });
+        cursor = String(result.cursor);
+        keys.push(...result.keys);
+      } while (cursor !== '0');
+
+      const results: { userId: string; username: string }[] = [];
+      for (const key of keys) {
+        const username = await this.redis.get(key);
+        const userId = key.split(':').pop()!;
+        results.push({ userId, username: username ?? 'unknown' });
+      }
+
+      return results;
+    } catch {
+      return [];
     }
-    const results = await pipeline.exec();
-
-    return keys.map((key, i) => {
-      const userId = key.split(':').pop()!;
-      return {
-        userId,
-        username: (results?.[i]?.[1] as string) ?? 'unknown',
-      };
-    });
-  }
-
-  onModuleDestroy() {
-    this.subscriber.disconnect();
   }
 }
