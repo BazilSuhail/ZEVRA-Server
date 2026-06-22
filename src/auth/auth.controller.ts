@@ -6,6 +6,7 @@ import {
   Request,
   UseGuards,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { RegisterDto } from './dto/register.dto';
@@ -17,6 +18,7 @@ import { RefreshDto } from './dto/refresh.dto';
 export class AuthController {
   constructor(private authService: AuthService) {}
 
+  @Throttle({ register: { limit: 5, ttl: 300000 } })
   @Post('register')
   async register(@Body() body: RegisterDto) {
     const result = await this.authService.register(
@@ -27,12 +29,14 @@ export class AuthController {
     return { success: true, ...result };
   }
 
+  @Throttle({ auth: { limit: 10, ttl: 60000 } })
   @Post('login/start')
   async loginStart(@Body() body: LoginStartDto) {
     const result = await this.authService.loginStart(body.username);
     return { success: true, ...result };
   }
 
+  @Throttle({ auth: { limit: 10, ttl: 60000 } })
   @Post('login/finish')
   async loginFinish(@Body() body: LoginFinishDto, @Request() req: any) {
     const result = await this.authService.loginFinish({
@@ -58,6 +62,7 @@ export class AuthController {
     return { success: true, message: 'Logged out' };
   }
 
+  @Throttle({ auth: { limit: 20, ttl: 60000 } })
   @Post('refresh')
   async refresh(@Body() body: RefreshDto) {
     const tokens = await this.authService.refreshTokens(body.refreshToken);
