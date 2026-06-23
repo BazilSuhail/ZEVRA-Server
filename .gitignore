@@ -37,6 +37,12 @@ package-lock.json
 !.vscode/launch.json
 !.vscode/extensions.json
 /docs
+# Ignore all markdown files
+*.md
+
+# Exception for README
+!README.md
+!readme.md
 
 # dotenv environment variable files
 .env
