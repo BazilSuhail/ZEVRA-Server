@@ -1,16 +1,34 @@
-import { Inject, Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, ForbiddenException, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { messages, memberships, channels, messageReads, users } from '../database/schema';
-import { eq, and, lt, desc, sql, count } from 'drizzle-orm';
-import { RealtimeService } from '../realtime/realtime.service';
+import { messages, memberships, channels, users } from '../database/schema';
+import { eq, and, lt, desc, sql } from 'drizzle-orm';
+import { CryptoService } from '../crypto/crypto.service';
 
 @Injectable()
 export class MessagesService {
+  private readonly logger = new Logger(MessagesService.name);
+
   constructor(
     @Inject(DB) private db: NodePgDatabase,
-    private realtime: RealtimeService,
+    private crypto: CryptoService,
   ) {}
+
+  private async nextSequence(channelId: string, tx: NodePgDatabase): Promise<number> {
+    // Lock the channel row so concurrent sends for this channel serialize.
+    await tx
+      .select({ id: channels.id })
+      .from(channels)
+      .where(eq(channels.id, channelId))
+      .for('update');
+
+    const [{ maxSeq }] = await tx
+      .select({ maxSeq: sql<number>`coalesce(max(${messages.sequenceNumber}), 0)` })
+      .from(messages)
+      .where(eq(messages.channelId, channelId));
+
+    return maxSeq + 1;
+  }
 
   async send(params: {
     userId: string;
@@ -39,83 +57,106 @@ export class MessagesService {
       throw new ForbiddenException('Not a member of this channel');
     }
 
-    // 2. Check for duplicate sequence number (replay protection)
-    const [existing] = await this.db
-      .select({ id: messages.id })
-      .from(messages)
-      .where(
-        and(
-          eq(messages.senderId, params.userId),
-          eq(messages.channelId, params.channelId),
-          eq(messages.sequenceNumber, params.sequenceNumber),
-        ),
-      );
+    // 2. Verify Ed25519 signature (if provided)
+    if (params.signature && params.signature !== '') {
+      const [sender] = await this.db
+        .select({ publicKeySign: users.publicKeySign })
+        .from(users)
+        .where(eq(users.id, params.userId));
 
-    if (existing) {
-      throw new ForbiddenException('Duplicate sequence number');
+      if (sender?.publicKeySign) {
+        const messageBytes = Buffer.from(
+          `${params.channelId}:${params.encryptedContent}:${params.sequenceNumber}`,
+          'utf-8',
+        );
+        const signatureBytes = Buffer.from(params.signature, 'base64');
+        const publicKeyBytes = Buffer.from(sender.publicKeySign, 'base64');
+
+        const valid = this.crypto.verify(messageBytes, signatureBytes, publicKeyBytes);
+        if (!valid) {
+          throw new BadRequestException('Invalid message signature');
+        }
+      }
     }
 
-    // 3. Insert message
-    const [msg] = await this.db
-      .insert(messages)
-      .values({
-        senderId: params.userId,
-        channelId: params.channelId,
-        encryptedContent: params.encryptedContent,
-        contentIv: params.contentIv,
-        contentTag: params.contentTag,
-        signature: params.signature,
-        sequenceNumber: params.sequenceNumber,
-        senderKeyEpoch: params.senderKeyEpoch,
-        messageType: params.messageType ?? 'TEXT',
-        metadata: (params.metadata as any) ?? null,
-      })
-      .returning({
-        id: messages.id,
-        sequenceNumber: messages.sequenceNumber,
-        createdAt: messages.createdAt,
-      });
+    // 3. Insert message with retry on unique constraint collision
+    //    The unique index idx_messages_channel_seq prevents duplicate sequence numbers.
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        const result = await this.db.transaction(async (tx) => {
+          const seq = await this.nextSequence(params.channelId, tx);
 
-    // 4. Update channel last message
-    await this.db
-      .update(channels)
-      .set({
-        lastMessageId: msg.id,
-        lastMessageAt: msg.createdAt,
-        updatedAt: new Date(),
-      })
-      .where(eq(channels.id, params.channelId));
+          const [msg] = await tx
+            .insert(messages)
+            .values({
+              senderId: params.userId,
+              channelId: params.channelId,
+              encryptedContent: params.encryptedContent,
+              contentIv: params.contentIv,
+              contentTag: params.contentTag,
+              signature: params.signature,
+              sequenceNumber: seq,
+              senderKeyEpoch: params.senderKeyEpoch,
+              messageType: params.messageType ?? 'TEXT',
+              metadata: (params.metadata as any) ?? null,
+            })
+            .returning({
+              id: messages.id,
+              senderId: messages.senderId,
+              channelId: messages.channelId,
+              encryptedContent: messages.encryptedContent,
+              contentIv: messages.contentIv,
+              contentTag: messages.contentTag,
+              signature: messages.signature,
+              sequenceNumber: messages.sequenceNumber,
+              senderKeyEpoch: messages.senderKeyEpoch,
+              messageType: messages.messageType,
+              metadata: messages.metadata,
+              isDeleted: messages.isDeleted,
+              createdAt: messages.createdAt,
+            });
 
-    // 5. Auto-mark sender's read position
-    await this.db
-      .update(memberships)
-      .set({
-        lastReadMessageId: msg.id,
-        lastReadAt: new Date(),
-      })
-      .where(
-        and(
-          eq(memberships.userId, params.userId),
-          eq(memberships.channelId, params.channelId),
-        ),
-      );
+          // Update channel last message
+          await tx
+            .update(channels)
+            .set({
+              lastMessageId: msg.id,
+              lastMessageAt: msg.createdAt,
+              updatedAt: new Date(),
+            })
+            .where(eq(channels.id, params.channelId));
 
-    // 6. Broadcast to channel subscribers
-    this.realtime.broadcastMessage(params.channelId, {
-      id: msg.id,
-      senderId: params.userId,
-      channelId: params.channelId,
-      encryptedContent: params.encryptedContent,
-      contentIv: params.contentIv,
-      contentTag: params.contentTag,
-      signature: params.signature,
-      sequenceNumber: params.sequenceNumber,
-      senderKeyEpoch: params.senderKeyEpoch,
-      messageType: params.messageType ?? 'TEXT',
-      createdAt: msg.createdAt,
-    });
+          // Auto-mark sender's read position
+          await tx
+            .update(memberships)
+            .set({
+              lastReadMessageId: msg.id,
+              lastReadAt: new Date(),
+            })
+            .where(
+              and(
+                eq(memberships.userId, params.userId),
+                eq(memberships.channelId, params.channelId),
+              ),
+            );
 
-    return msg;
+          return msg;
+        });
+
+        return result;
+      } catch (err: any) {
+        // Unique constraint violation on sequence number — retry
+        if (err?.code === '23505' && attempt < MAX_RETRIES - 1) {
+          this.logger.warn(`Sequence collision on channel ${params.channelId}, retrying (attempt ${attempt + 1})`);
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    // Unreachable: loop always returns or throws
+    throw new BadRequestException('Failed to assign sequence number');
   }
 
   async getMessages(channelId: string, userId: string, limit = 50, cursor?: string) {
@@ -168,92 +209,6 @@ export class MessagesService {
       nextCursor: hasMore ? data[data.length - 1].createdAt.toISOString() : null,
       hasMore,
     };
-  }
-
-  async getUnreadCounts(userId: string) {
-    const result = await this.db
-      .select({
-        channelId: memberships.channelId,
-        lastReadMessageId: memberships.lastReadMessageId,
-        lastReadAt: memberships.lastReadAt,
-      })
-      .from(memberships)
-      .where(eq(memberships.userId, userId));
-
-    const counts: Record<string, number> = {};
-
-    for (const row of result) {
-      const [unseen] = await this.db
-        .select({ total: count() })
-        .from(messages)
-        .where(
-          and(
-            eq(messages.channelId, row.channelId),
-            eq(messages.isDeleted, false),
-            row.lastReadAt
-              ? lt(messages.createdAt, row.lastReadAt)
-              : sql`true`,
-          ),
-        );
-
-      counts[row.channelId] = unseen.total;
-    }
-
-    return counts;
-  }
-
-  async markRead(userId: string, channelId: string, messageId: string) {
-    // Verify membership
-    const [membership] = await this.db
-      .select({ id: memberships.id })
-      .from(memberships)
-      .where(
-        and(
-          eq(memberships.userId, userId),
-          eq(memberships.channelId, channelId),
-        ),
-      );
-
-    if (!membership) {
-      throw new ForbiddenException('Not a member of this channel');
-    }
-
-    // Upsert read receipt
-    const [existing] = await this.db
-      .select({ id: messageReads.id })
-      .from(messageReads)
-      .where(
-        and(
-          eq(messageReads.messageId, messageId),
-          eq(messageReads.userId, userId),
-        ),
-      );
-
-    if (!existing) {
-      await this.db.insert(messageReads).values({
-        messageId,
-        userId,
-      });
-    }
-
-    // Update membership last read
-    await this.db
-      .update(memberships)
-      .set({
-        lastReadMessageId: messageId,
-        lastReadAt: new Date(),
-      })
-      .where(
-        and(
-          eq(memberships.userId, userId),
-          eq(memberships.channelId, channelId),
-        ),
-      );
-
-    // Broadcast read receipt
-    this.realtime.broadcastReadReceipt(channelId, userId, messageId);
-
-    return { success: true };
   }
 
   async deleteMessage(userId: string, messageId: string) {

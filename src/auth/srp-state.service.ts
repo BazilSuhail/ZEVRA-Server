@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 
 interface SrpState {
   b: bigint;
@@ -10,7 +10,6 @@ const TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 @Injectable()
 export class SrpStateService {
-  private readonly logger = new Logger(SrpStateService.name);
   private store = new Map<string, SrpState>();
 
   set(userId: string, state: Omit<SrpState, 'createdAt'>): void {
@@ -31,15 +30,5 @@ export class SrpStateService {
 
   delete(userId: string): void {
     this.store.delete(userId);
-  }
-
-  /** Cleanup expired entries — call periodically */
-  cleanup(): void {
-    const now = Date.now();
-    for (const [key, state] of this.store) {
-      if (now - state.createdAt > TTL_MS) {
-        this.store.delete(key);
-      }
-    }
   }
 }

@@ -24,7 +24,7 @@ export class SendMessageDto {
   signature!: string;
 
   @IsInt()
-  @Min(1)
+  @Min(0)
   sequenceNumber!: number;
 
   @IsInt()

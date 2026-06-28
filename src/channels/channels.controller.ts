@@ -53,4 +53,12 @@ export class ChannelsController {
   ) {
     return this.channelsService.archive(channelId, userId);
   }
+
+  @Post('mark-read')
+  markRead(
+    @CurrentUser('id') userId: string,
+    @Body() body: { channelId: string; lastReadMessageId: string },
+  ) {
+    return this.channelsService.markRead(userId, body.channelId, body.lastReadMessageId);
+  }
 }

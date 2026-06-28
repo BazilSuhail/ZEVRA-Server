@@ -9,7 +9,7 @@ export class AuditController {
   constructor(private auditService: AuditService) {}
 
   @Get('logs')
-  @Throttle({ default: { limit: 30, ttl: 60000 } })
+  @Throttle({ default: { limit: 10000, ttl: 60000 } })
   async getLogs(
     @Request() req: any,
     @Query('action') action?: string,
@@ -30,7 +30,7 @@ export class AuditController {
   }
 
   @Get('security')
-  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Throttle({ default: { limit: 10000, ttl: 60000 } })
   async getSecurityEvents(@Request() req: any) {
     const events = await this.auditService.getSecurityEvents(req.user.id);
     return { success: true, events };

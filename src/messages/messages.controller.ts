@@ -21,26 +21,16 @@ export class MessagesController {
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
   ) {
+    let parsedLimit = limit ? parseInt(limit, 10) : 50;
+    if (isNaN(parsedLimit) || parsedLimit < 1) parsedLimit = 1;
+    if (parsedLimit > 100) parsedLimit = 100;
+
     return this.messagesService.getMessages(
       channelId,
       userId,
-      limit ? parseInt(limit, 10) : 50,
+      parsedLimit,
       cursor,
     );
-  }
-
-  @Get('unread')
-  getUnreadCounts(@CurrentUser('id') userId: string) {
-    return this.messagesService.getUnreadCounts(userId);
-  }
-
-  @Post('channel/:channelId/read/:messageId')
-  markRead(
-    @CurrentUser('id') userId: string,
-    @Param('channelId') channelId: string,
-    @Param('messageId') messageId: string,
-  ) {
-    return this.messagesService.markRead(userId, channelId, messageId);
   }
 
   @Delete(':messageId')

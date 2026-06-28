@@ -1,60 +1,43 @@
-import { Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { users, senderKeys, memberships } from '../database/schema';
+import { users, senderKeys } from '../database/schema';
 import { eq, and, inArray } from 'drizzle-orm';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
 
 @Injectable()
 export class KeysService {
-  constructor(@Inject(DB) private db: NodePgDatabase) {}
+  private readonly logger = new Logger(KeysService.name);
 
-  async uploadKeys(userId: string, params: {
-    publicKey: string;
-    encryptedPrivateKey: string;
-    keySalt: string;
-    publicKeySign: string;
-    encryptedPrivateKeySign: string;
-    keySaltSign: string;
-    keyVersion: number;
-    argon2Params?: Record<string, number>;
-  }) {
-    const [updated] = await this.db
-      .update(users)
-      .set({
-        publicKey: params.publicKey,
-        encryptedPrivateKey: params.encryptedPrivateKey,
-        keySalt: params.keySalt,
-        publicKeySign: params.publicKeySign,
-        encryptedPrivateKeySign: params.encryptedPrivateKeySign,
-        keySaltSign: params.keySaltSign,
-        keyVersion: params.keyVersion,
-        argon2Params: (params.argon2Params as any) ?? undefined,
-        updatedAt: new Date(),
-      })
-      .where(eq(users.id, userId))
-      .returning({
-        id: users.id,
-        publicKey: users.publicKey,
-        publicKeySign: users.publicKeySign,
-        keyVersion: users.keyVersion,
-      });
-
-    return updated;
-  }
+  constructor(
+    @Inject(DB) private db: NodePgDatabase,
+    @InjectQueue('key-rotation') private keyRotationQueue: Queue,
+  ) {}
 
   async getPublicKeys(userIds: string[]) {
-    if (userIds.length === 0) return [];
+    if (userIds.length === 0) return {};
 
-    return this.db
+    const rows = await this.db
       .select({
         id: users.id,
-        username: users.username,
         publicKey: users.publicKey,
         publicKeySign: users.publicKeySign,
         keyVersion: users.keyVersion,
       })
       .from(users)
       .where(inArray(users.id, userIds));
+
+    // Return keyed by userId
+    const result: Record<string, { publicKey: string; publicKeySign: string; keyVersion: number }> = {};
+    for (const row of rows) {
+      result[row.id] = {
+        publicKey: row.publicKey,
+        publicKeySign: row.publicKeySign,
+        keyVersion: row.keyVersion,
+      };
+    }
+    return result;
   }
 
   async getMyKeys(userId: string) {
@@ -85,26 +68,13 @@ export class KeysService {
     newKeySaltSign: string;
     newKeyVersion: number;
   }) {
-    const [updated] = await this.db
-      .update(users)
-      .set({
-        publicKey: params.newPublicKey,
-        encryptedPrivateKey: params.newEncryptedPrivateKey,
-        keySalt: params.newKeySalt,
-        publicKeySign: params.newPublicKeySign,
-        encryptedPrivateKeySign: params.newEncryptedPrivateKeySign,
-        keySaltSign: params.newKeySaltSign,
-        keyVersion: params.newKeyVersion,
-        updatedAt: new Date(),
-      })
-      .where(eq(users.id, userId))
-      .returning({
-        id: users.id,
-        publicKey: users.publicKey,
-        keyVersion: users.keyVersion,
-      });
+    // Queue key rotation (background processing)
+    this.keyRotationQueue.add('rotate', {
+      userId,
+      ...params,
+    }).catch((err) => this.logger.warn(`Key rotation queue failed: ${err.message}`));
 
-    return updated;
+    return { success: true, message: 'Keys rotation queued' };
   }
 
   async uploadSenderKeys(ownerId: string, groupId: string, epoch: number, items: {
@@ -135,7 +105,7 @@ export class KeysService {
       await this.db.insert(senderKeys).values(values);
     }
 
-    return { count: values.length, groupId, epoch };
+    return { success: true, message: 'Sender keys uploaded' };
   }
 
   async getSenderKeys(groupId: string, receiverId: string, epoch?: number) {
@@ -163,29 +133,4 @@ export class KeysService {
       .orderBy(senderKeys.epoch);
   }
 
-  async getSenderKeysByGroup(groupId: string) {
-    return this.db
-      .select({
-        id: senderKeys.id,
-        groupId: senderKeys.groupId,
-        epoch: senderKeys.epoch,
-        receiverId: senderKeys.receiverId,
-        ownerId: senderKeys.ownerId,
-        encryptedKey: senderKeys.encryptedKey,
-        keySignature: senderKeys.keySignature,
-        createdAt: senderKeys.createdAt,
-      })
-      .from(senderKeys)
-      .where(eq(senderKeys.groupId, groupId))
-      .orderBy(senderKeys.epoch);
-  }
-
-  async deleteSenderKeysForGroup(groupId: string) {
-    const deleted = await this.db
-      .delete(senderKeys)
-      .where(eq(senderKeys.groupId, groupId))
-      .returning({ id: senderKeys.id });
-
-    return { count: deleted.length };
-  }
 }

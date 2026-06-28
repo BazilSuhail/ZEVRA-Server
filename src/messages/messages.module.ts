@@ -2,10 +2,10 @@ import { Module } from '@nestjs/common';
 import { MessagesController } from './messages.controller';
 import { MessagesService } from './messages.service';
 import { DatabaseModule } from '../database/database.module';
-import { RealtimeModule } from '../realtime/realtime.module';
+import { CryptoModule } from '../crypto/crypto.module';
 
 @Module({
-  imports: [DatabaseModule, RealtimeModule],
+  imports: [DatabaseModule, CryptoModule],
   controllers: [MessagesController],
   providers: [MessagesService],
   exports: [MessagesService],

@@ -9,10 +9,11 @@ import { JwtService } from '@nestjs/jwt';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { users, refreshTokens, auditLog } from '../database/schema';
-import { eq, and, lt } from 'drizzle-orm';
+import { eq, and, lt, or } from 'drizzle-orm';
 import { CryptoService } from '../crypto/crypto.service';
 import { SrpService } from './srp.service';
 import { SrpStateService } from './srp-state.service';
+import { PresenceService } from '../presence/presence.service';
 import * as crypto from 'node:crypto';
 
 @Injectable()
@@ -25,6 +26,7 @@ export class AuthService {
     private jwt: JwtService,
     private srp: SrpService,
     private srpState: SrpStateService,
+    private presence: PresenceService,
   ) {}
 
   // ─── Registration ─────────────────────────────────────────────────────────
@@ -33,9 +35,7 @@ export class AuthService {
     const [existing] = await this.db
       .select({ id: users.id, username: users.username, email: users.email })
       .from(users)
-      .where(
-        or(eq(users.username, username), eq(users.email, email)) as any,
-      );
+      .where(or(eq(users.username, username), eq(users.email, email)));
 
     if (existing) {
       throw new ConflictException(
@@ -166,6 +166,9 @@ export class AuthService {
       .set({ lastLoginAt: new Date(), status: 'ONLINE' })
       .where(eq(users.id, user.id));
 
+    // Set presence in Redis
+    await this.presence.online(user.id);
+
     const keys = {
       publicKey: user.publicKey,
       publicKeySign: user.publicKeySign,
@@ -244,6 +247,7 @@ export class AuthService {
   async logout(userId: string) {
     await this.db.update(users).set({ status: 'OFFLINE' }).where(eq(users.id, userId));
     await this.db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
+    await this.presence.offline(userId);
   }
 
   // ─── Audit ───────────────────────────────────────────────────────────────
@@ -269,8 +273,4 @@ export class AuthService {
 
 function bigintToHex(n: bigint): string {
   return n.toString(16).padStart(2, '0');
-}
-
-function or(...conditions: any[]) {
-  return conditions.reduce((a, b) => ({ or: [a, b] }));
 }

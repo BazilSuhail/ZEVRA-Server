@@ -1,7 +1,7 @@
 import { Inject, Injectable, ForbiddenException, NotFoundException, ConflictException } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { channels, memberships, users } from '../database/schema';
+import { channels, memberships, messages, users } from '../database/schema';
 import { eq, and, sql, desc } from 'drizzle-orm';
 
 @Injectable()
@@ -34,7 +34,41 @@ export class ChannelsService {
         .limit(1);
 
       if (existing) {
-        return { channelId: existing.id, existing: true };
+        // Ensure memberships exist for this DM
+        const allIds = [userId, ...participantIds];
+        for (const uid of allIds) {
+          const [hasMember] = await this.db
+            .select({ id: memberships.id })
+            .from(memberships)
+            .where(
+              and(
+                eq(memberships.userId, uid),
+                eq(memberships.channelId, existing.id),
+              ),
+            )
+            .limit(1);
+
+          if (!hasMember) {
+            await this.db.insert(memberships).values({
+              userId: uid,
+              channelId: existing.id,
+              role: uid === userId ? 'ADMIN' : 'MEMBER',
+            });
+          }
+        }
+
+        const [full] = await this.db
+          .select({
+            id: channels.id,
+            type: channels.type,
+            name: channels.name,
+            participantIds: channels.participantIds,
+            createdAt: channels.createdAt,
+          })
+          .from(channels)
+          .where(eq(channels.id, existing.id))
+          .limit(1);
+        return full;
       }
     }
 
@@ -47,7 +81,13 @@ export class ChannelsService {
         name: name ?? null,
         participantIds: allParticipantIds,
       })
-      .returning({ id: channels.id, createdAt: channels.createdAt });
+      .returning({
+        id: channels.id,
+        type: channels.type,
+        name: channels.name,
+        participantIds: channels.participantIds,
+        createdAt: channels.createdAt,
+      });
 
     // Create memberships for all participants
     const members = allParticipantIds.map((uid) => ({
@@ -58,7 +98,7 @@ export class ChannelsService {
 
     await this.db.insert(memberships).values(members);
 
-    return { channelId: channel.id, existing: false };
+    return channel;
   }
 
   async getInbox(userId: string) {
@@ -67,11 +107,18 @@ export class ChannelsService {
         id: channels.id,
         name: channels.name,
         type: channels.type,
+        isArchived: channels.isArchived,
         lastMessageId: channels.lastMessageId,
         lastMessageAt: channels.lastMessageAt,
+        lastMessageContent: messages.encryptedContent,
+        lastMessageSenderId: messages.senderId,
+        lastMessageSenderName: users.username,
+        lastMessageIv: messages.contentIv,
+        lastMessageTag: messages.contentTag,
+        lastMessageSenderKeyEpoch: messages.senderKeyEpoch,
         participantIds: channels.participantIds,
         createdAt: channels.createdAt,
-        lastReadAt: memberships.lastReadAt,
+        lastReadMessageId: memberships.lastReadMessageId,
       })
       .from(channels)
       .innerJoin(
@@ -81,54 +128,70 @@ export class ChannelsService {
           eq(memberships.userId, userId),
         ),
       )
+      .leftJoin(messages, eq(channels.lastMessageId, messages.id))
+      .leftJoin(users, eq(messages.senderId, users.id))
       .orderBy(desc(channels.lastMessageAt));
 
-    // Get unread counts in batch
-    const channelIds = result.map((c) => c.id);
-    const unreadCounts = await this.getUnreadBatch(userId, channelIds);
-
-    return result.map((c) => ({
-      ...c,
-      unreadCount: unreadCounts[c.id] ?? 0,
-    }));
+    return result;
   }
 
-  private async getUnreadBatch(userId: string, channelIds: string[]) {
-    if (channelIds.length === 0) return {};
-
-    // Fetch all memberships with lastReadAt for these channels
-    const memberRows = await this.db
-      .select({
-        channelId: memberships.channelId,
-        lastReadAt: memberships.lastReadAt,
-      })
+  async markRead(userId: string, channelId: string, lastReadMessageId: string) {
+    // 1. Verify membership
+    const [membership] = await this.db
+      .select({ id: memberships.id, lastReadMessageId: memberships.lastReadMessageId })
       .from(memberships)
       .where(
         and(
           eq(memberships.userId, userId),
-          sql`${memberships.channelId} = ANY(${channelIds})`,
+          eq(memberships.channelId, channelId),
         ),
       );
 
-    const counts: Record<string, number> = {};
-
-    for (const row of memberRows) {
-      const [unseen] = await this.db
-        .select({ total: sql<number>`count(*)::int` })
-        .from(channels)
-        .where(
-          and(
-            eq(channels.id, row.channelId),
-            row.lastReadAt
-              ? sql`${channels.lastMessageAt} > ${row.lastReadAt}`
-              : sql`true`,
-          ),
-        );
-
-      counts[row.channelId] = unseen.total;
+    if (!membership) {
+      throw new ForbiddenException('Not a member of this channel');
     }
 
-    return counts;
+    // 2. Verify the message belongs to this channel
+    const [msg] = await this.db
+      .select({ id: messages.id, createdAt: messages.createdAt })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.id, lastReadMessageId),
+          eq(messages.channelId, channelId),
+        ),
+      );
+
+    if (!msg) {
+      throw new NotFoundException('Message not found in this channel');
+    }
+
+    // 3. Only advance forward — never regress the read marker
+    if (membership.lastReadMessageId) {
+      const [current] = await this.db
+        .select({ createdAt: messages.createdAt })
+        .from(messages)
+        .where(eq(messages.id, membership.lastReadMessageId));
+
+      if (current && current.createdAt >= msg.createdAt) {
+        return { success: true, advanced: false };
+      }
+    }
+
+    await this.db
+      .update(memberships)
+      .set({
+        lastReadMessageId,
+        lastReadAt: new Date(),
+      })
+      .where(
+        and(
+          eq(memberships.userId, userId),
+          eq(memberships.channelId, channelId),
+        ),
+      );
+
+    return { success: true, advanced: true };
   }
 
   async getChannel(channelId: string, userId: string) {
@@ -308,11 +371,21 @@ export class ChannelsService {
       throw new ForbiddenException('Only admins can archive channels');
     }
 
-    await this.db
-      .update(channels)
-      .set({ isArchived: true, updatedAt: new Date() })
+    // Get current state to toggle
+    const [channel] = await this.db
+      .select({ isArchived: channels.isArchived })
+      .from(channels)
       .where(eq(channels.id, channelId));
 
-    return { success: true };
+    if (!channel) throw new NotFoundException('Channel not found');
+
+    const newArchivedState = !channel.isArchived;
+
+    await this.db
+      .update(channels)
+      .set({ isArchived: newArchivedState, updatedAt: new Date() })
+      .where(eq(channels.id, channelId));
+
+    return { isArchived: newArchivedState };
   }
 }

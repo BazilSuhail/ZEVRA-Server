@@ -267,6 +267,12 @@ Server runs on `http://localhost:3000`
 
 ## API Endpoints
 
+### Health
+
+| Method | Endpoint | Description | Rate Limit |
+|--------|----------|-------------|------------|
+| GET | `/health` | Health check | - |
+
 ### Auth
 
 | Method | Endpoint | Description | Rate Limit |
@@ -297,7 +303,7 @@ Server runs on `http://localhost:3000`
 | GET | `/channels/:id` | Get channel info | 60 / min |
 | POST | `/channels/:id/members` | Add member | 60 / min |
 | DELETE | `/channels/:id/members/:userId` | Remove member | 60 / min |
-| POST | `/channels/:id/archive` | Archive channel | 60 / min |
+| POST | `/channels/:id/archive` | Toggle archive | 60 / min |
 
 ### Keys
 
@@ -309,6 +315,7 @@ Server runs on `http://localhost:3000`
 | GET | `/keys/public?userIds=` | Get public keys | 60 / min |
 | POST | `/keys/sender-keys` | Upload sender keys | 60 / min |
 | GET | `/keys/sender-keys/:groupId` | Get sender keys | 60 / min |
+| GET | `/keys/sender-keys/:groupId/all` | Get all group sender keys | 60 / min |
 
 ### Users
 
