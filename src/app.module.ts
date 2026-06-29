@@ -15,6 +15,7 @@ import { QueuesModule } from './shared/queues/queues.module';
 import { PresenceModule } from './shared/presence/presence.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { SocketModule } from './socket/socket.module';
+import { ChatModule } from './chat/chat.module';
 import { AppController } from './app.controller';
 
 @Module({
@@ -42,6 +43,7 @@ import { AppController } from './app.controller';
     PresenceModule,
     AuditModule,
     SocketModule,
+    ChatModule,
   ],
   controllers: [AppController],
   providers: [

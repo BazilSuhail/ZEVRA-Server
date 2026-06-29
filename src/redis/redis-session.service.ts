@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { RedisClientType } from 'redis';
 
-interface PendingMessage {
+export interface PendingMessage {
   messageId: string;
   channelId: string;
   senderId: string;
