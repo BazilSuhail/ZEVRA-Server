@@ -1,49 +1,56 @@
 import { Inject, Injectable, ForbiddenException, NotFoundException, ConflictException } from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { channels, memberships, messages, users } from '../../database/schema';
+import { channels, memberships, messages, users, messageReads } from '../../database/schema';
 import { eq, and, sql, desc } from 'drizzle-orm';
+import { RedisSessionService } from '../../redis/redis-session.service';
 
 @Injectable()
 export class ChannelsService {
-  constructor(@Inject(DB) private db: NodePgDatabase) {}
+  constructor(
+    @Inject(DB) private db: NodePgDatabase,
+    private sessionService: RedisSessionService,
+  ) {}
 
   async create(userId: string, participantIds: string[], type: string, name?: string) {
-    // DM: require exactly 1 other participant
     if (type === 'DIRECT' && participantIds.length !== 1) {
       throw new ForbiddenException('Direct message requires exactly 1 other participant');
     }
 
-    // Prevent self-DM
     if (type === 'DIRECT' && participantIds[0] === userId) {
       throw new ForbiddenException('Cannot create DM with yourself');
     }
 
-    // Check for existing DM with same participants
+    // DM: check for existing channel with same participants via memberships
     if (type === 'DIRECT') {
-      const allIds = [userId, ...participantIds].sort();
-      const [existing] = await this.db
-        .select({ id: channels.id, participantIds: channels.participantIds })
-        .from(channels)
+      const targetUserId = participantIds[0];
+
+      // Find channels where both users are members
+      const existingChannels = await this.db
+        .select({ channelId: memberships.channelId })
+        .from(memberships)
+        .innerJoin(channels, eq(channels.id, memberships.channelId))
         .where(
           and(
             eq(channels.type, 'DIRECT'),
-            sql`${channels.participantIds} @> ARRAY[${allIds[0]}, ${allIds[1]}]::text[]`,
+            sql`${memberships.userId} IN (${userId}, ${targetUserId})`,
           ),
         )
-        .limit(1);
+        .groupBy(memberships.channelId)
+        .having(sql`COUNT(*) = 2`);
 
-      if (existing) {
-        // Ensure memberships exist for this DM
-        const allIds = [userId, ...participantIds];
-        for (const uid of allIds) {
+      if (existingChannels.length > 0) {
+        const existingChannelId = existingChannels[0].channelId;
+
+        // Ensure memberships exist
+        for (const uid of [userId, targetUserId]) {
           const [hasMember] = await this.db
             .select({ id: memberships.id })
             .from(memberships)
             .where(
               and(
                 eq(memberships.userId, uid),
-                eq(memberships.channelId, existing.id),
+                eq(memberships.channelId, existingChannelId),
               ),
             )
             .limit(1);
@@ -51,7 +58,7 @@ export class ChannelsService {
           if (!hasMember) {
             await this.db.insert(memberships).values({
               userId: uid,
-              channelId: existing.id,
+              channelId: existingChannelId,
               role: uid === userId ? 'ADMIN' : 'MEMBER',
             });
           }
@@ -62,30 +69,27 @@ export class ChannelsService {
             id: channels.id,
             type: channels.type,
             name: channels.name,
-            participantIds: channels.participantIds,
             createdAt: channels.createdAt,
           })
           .from(channels)
-          .where(eq(channels.id, existing.id))
+          .where(eq(channels.id, existingChannelId))
           .limit(1);
         return full;
       }
     }
 
-    // Insert channel
+    // Insert channel (no participantIds column)
     const allParticipantIds = [userId, ...participantIds];
     const [channel] = await this.db
       .insert(channels)
       .values({
         type,
         name: name ?? null,
-        participantIds: allParticipantIds,
       })
       .returning({
         id: channels.id,
         type: channels.type,
         name: channels.name,
-        participantIds: channels.participantIds,
         createdAt: channels.createdAt,
       });
 
@@ -98,10 +102,29 @@ export class ChannelsService {
 
     await this.db.insert(memberships).values(members);
 
+    // Denormalize into Redis
+    for (const uid of allParticipantIds) {
+      await this.sessionService.addChannelMember(channel.id, uid);
+    }
+
     return channel;
   }
 
   async getInbox(userId: string) {
+    // Get channel IDs where user is a member
+    const memberChannels = await this.db
+      .select({
+        channelId: memberships.channelId,
+        lastReadMessageId: memberships.lastReadMessageId,
+      })
+      .from(memberships)
+      .where(eq(memberships.userId, userId));
+
+    if (memberChannels.length === 0) return [];
+
+    const channelIds = memberChannels.map((mc) => mc.channelId);
+
+    // Get channels with last message info
     const result = await this.db
       .select({
         id: channels.id,
@@ -116,23 +139,21 @@ export class ChannelsService {
         lastMessageIv: messages.contentIv,
         lastMessageTag: messages.contentTag,
         lastMessageSenderKeyEpoch: messages.senderKeyEpoch,
-        participantIds: channels.participantIds,
         createdAt: channels.createdAt,
-        lastReadMessageId: memberships.lastReadMessageId,
       })
       .from(channels)
-      .innerJoin(
-        memberships,
-        and(
-          eq(memberships.channelId, channels.id),
-          eq(memberships.userId, userId),
-        ),
-      )
       .leftJoin(messages, eq(channels.lastMessageId, messages.id))
       .leftJoin(users, eq(messages.senderId, users.id))
+      .where(sql`${channels.id} IN ${channelIds}`)
       .orderBy(desc(channels.lastMessageAt));
 
-    return result;
+    // Attach lastReadMessageId from membership data
+    const membershipMap = new Map(memberChannels.map((mc) => [mc.channelId, mc.lastReadMessageId]));
+
+    return result.map((channel) => ({
+      ...channel,
+      lastReadMessageId: membershipMap.get(channel.id) ?? null,
+    }));
   }
 
   async markRead(userId: string, channelId: string, lastReadMessageId: string) {
@@ -178,18 +199,30 @@ export class ChannelsService {
       }
     }
 
-    await this.db
-      .update(memberships)
-      .set({
-        lastReadMessageId,
-        lastReadAt: new Date(),
-      })
-      .where(
-        and(
-          eq(memberships.userId, userId),
-          eq(memberships.channelId, channelId),
-        ),
-      );
+    // 4. Update membership watermark + insert read receipt
+    await this.db.transaction(async (tx) => {
+      await tx
+        .update(memberships)
+        .set({
+          lastReadMessageId,
+          lastReadAt: new Date(),
+        })
+        .where(
+          and(
+            eq(memberships.userId, userId),
+            eq(memberships.channelId, channelId),
+          ),
+        );
+
+      // Insert read receipt (upsert on unique constraint)
+      await tx
+        .insert(messageReads)
+        .values({
+          messageId: lastReadMessageId,
+          userId,
+        })
+        .onConflictDoNothing();
+    });
 
     return { success: true, advanced: true };
   }
@@ -279,21 +312,14 @@ export class ChannelsService {
       })
       .returning({ id: memberships.id });
 
-    // Update channel participantIds
-    const [channel] = await this.db
-      .select({ participantIds: channels.participantIds })
-      .from(channels)
+    // Update channel timestamp
+    await this.db
+      .update(channels)
+      .set({ updatedAt: new Date() })
       .where(eq(channels.id, channelId));
 
-    if (channel) {
-      await this.db
-        .update(channels)
-        .set({
-          participantIds: [...channel.participantIds, newUserId],
-          updatedAt: new Date(),
-        })
-        .where(eq(channels.id, channelId));
-    }
+    // Denormalize into Redis
+    await this.sessionService.addChannelMember(channelId, newUserId);
 
     // Return new member info
     const [user] = await this.db
@@ -337,21 +363,14 @@ export class ChannelsService {
       throw new NotFoundException('Member not found in channel');
     }
 
-    // Update channel participantIds
-    const [channel] = await this.db
-      .select({ participantIds: channels.participantIds })
-      .from(channels)
+    // Update channel timestamp
+    await this.db
+      .update(channels)
+      .set({ updatedAt: new Date() })
       .where(eq(channels.id, channelId));
 
-    if (channel) {
-      await this.db
-        .update(channels)
-        .set({
-          participantIds: channel.participantIds.filter((id) => id !== targetUserId),
-          updatedAt: new Date(),
-        })
-        .where(eq(channels.id, channelId));
-    }
+    // Remove from Redis
+    await this.sessionService.removeChannelMember(channelId, targetUserId);
 
     return { success: true };
   }
@@ -371,7 +390,6 @@ export class ChannelsService {
       throw new ForbiddenException('Only admins can archive channels');
     }
 
-    // Get current state to toggle
     const [channel] = await this.db
       .select({ isArchived: channels.isArchived })
       .from(channels)

@@ -57,7 +57,6 @@ export const channels = pgTable('channels', {
   isArchived: boolean('is_archived').notNull().default(false),
   lastMessageId: uuid('last_message_id'),
   lastMessageAt: timestamp('last_message_at'),
-  participantIds: text('participant_ids').array().notNull().default([]),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });
@@ -166,6 +165,26 @@ export const messageReads = pgTable(
   (t) => [
     uniqueIndex('idx_message_reads_message_user').on(t.messageId, t.userId),
     index('idx_message_reads_user_read_at').on(t.userId, t.readAt),
+  ],
+);
+
+// ─── Pending Messages ──────────────────────────────────────────────────────
+
+export const pendingMessages = pgTable(
+  'pending_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    messageId: uuid('message_id')
+      .notNull()
+      .references(() => messages.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    deliveredAt: timestamp('delivered_at'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('idx_pending_user_undelivered').on(t.userId, t.deliveredAt),
   ],
 );
 
