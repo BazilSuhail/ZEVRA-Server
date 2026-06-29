@@ -7,6 +7,6 @@ import { DatabaseModule } from '../database/database.module';
 @Module({
   imports: [DatabaseModule],
   providers: [SocketGateway, SocketService, SocketAuthGuard],
-  exports: [SocketService, SocketGateway],
+  exports: [SocketService, SocketGateway, SocketAuthGuard],
 })
 export class SocketModule {}

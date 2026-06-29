@@ -2,13 +2,17 @@ import { Injectable, Logger, ForbiddenException } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { messages, memberships, users, pendingMessages } from '../database/schema';
-import { eq, and, lt, desc, sql } from 'drizzle-orm';
+import { messages, memberships, pendingMessages } from '../database/schema';
+import { eq, and, lt, desc } from 'drizzle-orm';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
 import { MessagesService } from '../modules/messages/messages.service';
 import { RedisCacheService } from '../redis/redis-cache.service';
 import { RedisSessionService } from '../redis/redis-session.service';
 import { RedisPubSubService } from '../redis/redis-pubsub.service';
 import { SocketService } from '../socket/socket.service';
+import { MessageDeliveryJob } from '../shared/queues/message-delivery.processor';
+import { ReadReceiptJob } from '../shared/queues/read-receipt.processor';
 
 interface SendMessageInput {
   userId: string;
@@ -23,7 +27,7 @@ interface SendMessageInput {
   metadata?: Record<string, unknown>;
 }
 
-interface PendingMessagePayload {
+export interface PendingMessagePayload {
   messageId: string;
   channelId: string;
   senderId: string;
@@ -47,12 +51,14 @@ export class ChatService {
     private sessionService: RedisSessionService,
     private pubSubService: RedisPubSubService,
     private socketService: SocketService,
+    @InjectQueue('message-delivery') private deliveryQueue: Queue<MessageDeliveryJob>,
+    @InjectQueue('read-receipt') private readReceiptQueue: Queue<ReadReceiptJob>,
   ) {}
 
-  // ─── Send Message ──────────────────────────────────────────────────────
+  // ─── Send Message (sync persist + async delivery) ──────────────────────
 
   async sendMessage(input: SendMessageInput) {
-    // 1. Persist to Postgres via MessagesService (handles membership + signature + sequence)
+    // 1. Persist to Postgres (handles membership + signature + sequence)
     const msg = await this.messagesService.send(input);
 
     // 2. Build payload for distribution
@@ -72,48 +78,23 @@ export class ChatService {
     // 3. Cache in Redis (recent 50 messages per channel)
     await this.cacheService.cacheMessage(input.channelId, payload);
 
-    // 4. Get channel members (from Redis or fallback to Postgres)
-    let members = await this.sessionService.getChannelMembers(input.channelId);
-    if (members.length === 0) {
-      // Fallback: load from Postgres and denormalize
-      const dbMembers = await this.db
-        .select({ userId: memberships.userId })
-        .from(memberships)
-        .where(eq(memberships.channelId, input.channelId));
-      members = dbMembers.map((m) => m.userId);
-      for (const uid of members) {
-        await this.sessionService.addChannelMember(input.channelId, uid);
-      }
-    }
-
-    // 5. Process each member (skip sender)
-    const onlineUsers = await this.sessionService.getOnlineUsers(members);
-
-    const memberPromises = members.map(async (memberId) => {
-      if (memberId === input.userId) return;
-
-      if (onlineUsers.has(memberId)) {
-        // Online: deliver via Socket.io
-        await this.socketService.emitToUser(memberId, 'message:new', payload);
-      } else {
-        // Offline: queue for later delivery
-        await this.sessionService.addPendingMessage(memberId, payload);
-      }
-
-      // Increment unread count for all members (including offline)
-      await this.cacheService.incrementUnread(memberId, input.channelId);
-    });
-
-    await Promise.allSettled(memberPromises);
-
-    // 6. Broadcast to channel room (for users who have joined the Socket.io room)
-    this.socketService.broadcastToChannel(input.channelId, 'message:new', payload);
-
-    // 7. Publish to Redis PubSub (for cross-node fan-out)
-    await this.pubSubService.publishToGroup(input.channelId, JSON.stringify({
-      event: 'message:new',
-      data: payload,
-    }));
+    // 4. Enqueue async delivery via BullMQ (non-blocking)
+    this.deliveryQueue.add('deliver', {
+      messageId: msg.id,
+      channelId: msg.channelId,
+      senderId: msg.senderId,
+      encryptedContent: msg.encryptedContent,
+      contentIv: msg.contentIv,
+      contentTag: msg.contentTag,
+      sequenceNumber: msg.sequenceNumber,
+      senderKeyEpoch: msg.senderKeyEpoch,
+      messageType: msg.messageType,
+      createdAt: msg.createdAt.toISOString(),
+    }, {
+      priority: 1, // High priority for message delivery
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 1000 },
+    }).catch((err) => this.logger.warn(`Delivery queue add failed: ${err.message}`));
 
     return msg;
   }
@@ -181,7 +162,7 @@ export class ChatService {
     };
   }
 
-  // ─── Mark as Read ──────────────────────────────────────────────────────
+  // ─── Mark as Read (sync persist + async broadcast) ─────────────────────
 
   async markAsRead(userId: string, channelId: string, messageId: string) {
     // 1. Verify membership
@@ -224,7 +205,7 @@ export class ChatService {
       }
     }
 
-    // 4. Update membership + read receipt
+    // 4. Update membership + read receipt in transaction
     await this.db.transaction(async (tx) => {
       await tx
         .update(memberships)
@@ -245,15 +226,13 @@ export class ChatService {
     // 5. Reset unread count
     await this.cacheService.resetUnread(userId, channelId);
 
-    // 6. Broadcast read receipt to channel
-    const readReceipt = { userId, messageId, channelId, readAt: new Date().toISOString() };
-    this.socketService.broadcastToChannel(channelId, 'message:read', readReceipt);
-
-    // 7. Publish via PubSub
-    await this.pubSubService.publishToGroup(channelId, JSON.stringify({
-      event: 'message:read',
-      data: readReceipt,
-    }));
+    // 6. Enqueue async read receipt broadcast via BullMQ
+    this.readReceiptQueue.add('broadcast', {
+      userId,
+      channelId,
+      messageId,
+      readAt: new Date().toISOString(),
+    }).catch((err) => this.logger.warn(`Read receipt queue add failed: ${err.message}`));
 
     return { success: true, advanced: true };
   }
@@ -261,7 +240,6 @@ export class ChatService {
   // ─── Get Unread Counts ────────────────────────────────────────────────
 
   async getUnreadCounts(userId: string) {
-    // Get all channels user belongs to
     const memberChannels = await this.db
       .select({ channelId: memberships.channelId })
       .from(memberships)
@@ -270,7 +248,6 @@ export class ChatService {
     const channelIds = memberChannels.map((mc) => mc.channelId);
     if (channelIds.length === 0) return {};
 
-    // Get cached unread counts
     const counts = await this.cacheService.getUnreadCounts(userId, channelIds);
     return counts;
   }
@@ -281,19 +258,15 @@ export class ChatService {
     const pending = await this.sessionService.getPendingMessages(userId);
     if (pending.length === 0) return [];
 
-    // Deliver to user
     await this.socketService.emitToUser(userId, 'messages:pending', pending);
-
-    // Clear after delivery
     await this.sessionService.clearPendingMessages(userId);
 
     return pending;
   }
 
-  // ─── Join Channel (Socket.io room + Redis) ────────────────────────────
+  // ─── Join Channel ──────────────────────────────────────────────────────
 
   async onUserJoinChannel(userId: string, channelId: string) {
-    // Ensure user is a member
     const [membership] = await this.db
       .select({ id: memberships.id })
       .from(memberships)
@@ -308,7 +281,6 @@ export class ChatService {
       throw new ForbiddenException('Not a member of this channel');
     }
 
-    // Denormalize in Redis
     await this.sessionService.addChannelMember(channelId, userId);
   }
 
@@ -320,7 +292,6 @@ export class ChatService {
       const { event, data } = parsed;
 
       if (event === 'message:new') {
-        // Broadcast to local Socket.io room
         this.socketService.broadcastToChannel(channelId, event, data);
       } else if (event === 'message:read') {
         this.socketService.broadcastToChannel(channelId, event, data);
