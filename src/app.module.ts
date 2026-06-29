@@ -5,15 +5,15 @@ import { JwtModule } from '@nestjs/jwt';
 import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { RedisModule } from './redis/redis.module';
-import { AuthModule } from './auth/auth.module';
-import { UsersModule } from './users/users.module';
+import { AuthModule } from './modules/auth/auth.module';
+import { UsersModule } from './modules/users/users.module';
 import { CommonModule } from './common/common.module';
-import { MessagesModule } from './messages/messages.module';
-import { ChannelsModule } from './channels/channels.module';
-import { KeysModule } from './keys/keys.module';
-import { QueuesModule } from './queues/queues.module';
-import { PresenceModule } from './presence/presence.module';
-import { AuditModule } from './audit/audit.module';
+import { MessagesModule } from './modules/messages/messages.module';
+import { ChannelsModule } from './modules/channels/channels.module';
+import { KeysModule } from './modules/keys/keys.module';
+import { QueuesModule } from './shared/queues/queues.module';
+import { PresenceModule } from './shared/presence/presence.module';
+import { AuditModule } from './modules/audit/audit.module';
 import { AppController } from './app.controller';
 
 @Module({

@@ -13,6 +13,9 @@ export const DB = 'DB_CONNECTION';
       useFactory: () => {
         const pool = new Pool({
           connectionString: process.env.DATABASE_URL!,
+          ssl: {
+            rejectUnauthorized: false,
+          },
         });
         return drizzle(pool, { schema });
       },
