@@ -10,6 +10,9 @@ import { Socket } from 'socket.io';
 import { SocketAuthGuard, SocketUser } from '../socket/socket-auth.guard';
 import { ChatService } from './chat.service';
 import { RedisPubSubService } from '../redis/redis-pubsub.service';
+import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
+
+const MAX_MESSAGE_SIZE = 10 * 1024; // 10KB
 
 @WebSocketGateway({ cors: true })
 export class ChatGateway implements OnGatewayInit {
@@ -18,10 +21,10 @@ export class ChatGateway implements OnGatewayInit {
   constructor(
     private chatService: ChatService,
     private pubSubService: RedisPubSubService,
+    private rateLimitService: RateLimitService,
   ) {}
 
   afterInit() {
-    // Subscribe to all group channels for cross-node delivery
     this.subscribeToGroupChannels();
   }
 
@@ -44,6 +47,21 @@ export class ChatGateway implements OnGatewayInit {
     },
   ) {
     const user: SocketUser = client.data.user;
+
+    // Rate limit
+    const rl = await this.rateLimitService.checkRateLimit(
+      `send:${user.id}`,
+      RateLimitService.SEND_MESSAGE,
+    );
+    if (!rl.allowed) {
+      return { success: false, error: 'RATE_LIMITED', message: 'Too many messages' };
+    }
+
+    // Message size validation
+    const contentSize = Buffer.byteLength(data.encryptedContent, 'utf-8');
+    if (contentSize > MAX_MESSAGE_SIZE) {
+      return { success: false, error: 'PAYLOAD_TOO_LARGE', message: 'Message exceeds 10KB limit' };
+    }
 
     try {
       const msg = await this.chatService.sendMessage({
@@ -68,6 +86,15 @@ export class ChatGateway implements OnGatewayInit {
     @MessageBody() data: { channelId: string; limit?: number; cursor?: string },
   ) {
     const user: SocketUser = client.data.user;
+
+    // Rate limit
+    const rl = await this.rateLimitService.checkRateLimit(
+      `getmsg:${user.id}`,
+      RateLimitService.GET_MESSAGES,
+    );
+    if (!rl.allowed) {
+      return { success: false, error: 'RATE_LIMITED', message: 'Too many requests' };
+    }
 
     try {
       const result = await this.chatService.getMessages(

@@ -14,6 +14,7 @@ import { SocketService } from './socket.service';
 import { RedisSessionService } from '../redis/redis-session.service';
 import { RedisCacheService } from '../redis/redis-cache.service';
 import { RedisPubSubService } from '../redis/redis-pubsub.service';
+import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
 
 @WebSocketGateway({ cors: true })
 export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -22,14 +23,15 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
-  // Heartbeat interval per socket
   private heartbeatIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  private ipConnections = new Map<string, Set<string>>();
 
   constructor(
     private socketService: SocketService,
     private sessionService: RedisSessionService,
     private cacheService: RedisCacheService,
     private pubSubService: RedisPubSubService,
+    private rateLimitService: RateLimitService,
   ) {}
 
   afterInit() {
@@ -42,12 +44,29 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @UseGuards(SocketAuthGuard)
   async handleConnection(@ConnectedSocket() client: Socket) {
     const user: SocketUser = client.data.user;
+    const ip = (client.handshake.headers['x-forwarded-for'] as string) || client.handshake.address;
+
+    // IP connection rate limit
+    const ipKey = `ip:${ip}`;
+    const ipResult = await this.rateLimitService.checkRateLimit(ipKey, RateLimitService.CONNECTION_PER_IP);
+    if (!ipResult.allowed) {
+      this.logger.warn(`Connection rejected — IP ${ip} exceeded rate limit`);
+      client.emit('error', { code: 'RATE_LIMITED', message: 'Too many connections' });
+      client.disconnect(true);
+      return;
+    }
+
+    // Track IP connections
+    if (!this.ipConnections.has(ip)) {
+      this.ipConnections.set(ip, new Set());
+    }
+    this.ipConnections.get(ip)!.add(client.id);
+
     this.logger.log(`Client connected: ${client.id} (user: ${user.username})`);
 
-    // Single-session enforcement: check for existing connection
+    // Single-session enforcement
     const existingSocketId = await this.sessionService.getSession(user.id);
     if (existingSocketId && existingSocketId !== client.id) {
-      // Disconnect old socket
       const existingSocket = this.server.sockets.sockets.get(existingSocketId);
       if (existingSocket) {
         existingSocket.emit('forced-disconnect', {
@@ -58,19 +77,15 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
       this.logger.log(`Disconnected old session for user ${user.username}`);
     }
 
-    // Register new session
     await this.sessionService.registerSession(user.id, client.id);
     await this.sessionService.setOnline(user.id);
 
-    // Subscribe to user's personal channel
     await this.pubSubService.subscribeToUser(user.id, (message) => {
       client.emit('user:message', JSON.parse(message));
     });
 
-    // Start heartbeat
     this.startHeartbeat(client.id, user.id);
 
-    // Send connection ack
     client.emit('connected', {
       userId: user.id,
       username: user.username,
@@ -86,20 +101,24 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.logger.log(`Client disconnected: ${client.id} (user: ${user.username})`);
 
-    // Stop heartbeat
     const interval = this.heartbeatIntervals.get(client.id);
     if (interval) {
       clearInterval(interval);
       this.heartbeatIntervals.delete(client.id);
     }
 
-    // Only remove session if this is the current socket for the user
+    // Clean up IP tracking
+    const ip = (client.handshake.headers['x-forwarded-for'] as string) || client.handshake.address;
+    const ipSockets = this.ipConnections.get(ip);
+    if (ipSockets) {
+      ipSockets.delete(client.id);
+      if (ipSockets.size === 0) this.ipConnections.delete(ip);
+    }
+
     const currentSocketId = await this.sessionService.getSession(user.id);
     if (currentSocketId === client.id) {
       await this.sessionService.removeSession(user.id, client.id);
       await this.sessionService.setOffline(user.id);
-
-      // Unsubscribe from user channel
       await this.pubSubService.unsubscribeFromUser(user.id);
     }
   }
@@ -164,9 +183,15 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     const user: SocketUser = client.data.user;
 
+    // Rate limit typing events
+    const rl = await this.rateLimitService.checkRateLimit(
+      `typing:${user.id}`,
+      RateLimitService.TYPING,
+    );
+    if (!rl.allowed) return;
+
     await this.cacheService.setTyping(data.channelId, user.id);
 
-    // Broadcast to channel (except sender)
     client.to(`channel:${data.channelId}`).emit('typing:start', {
       userId: user.id,
       username: user.username,
@@ -181,6 +206,12 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { channelId: string },
   ) {
     const user: SocketUser = client.data.user;
+
+    const rl = await this.rateLimitService.checkRateLimit(
+      `typing:${user.id}`,
+      RateLimitService.TYPING,
+    );
+    if (!rl.allowed) return;
 
     await this.cacheService.clearTyping(data.channelId, user.id);
 

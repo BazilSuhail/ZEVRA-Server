@@ -5,9 +5,10 @@ import { HttpExceptionFilter } from './common/exception.filter';
 import helmet from 'helmet';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, {
+    logger: ['error', 'warn', 'log'],
+  });
 
-  // Security headers
   app.use(helmet());
 
   app.enableCors({
@@ -23,10 +24,30 @@ async function bootstrap() {
 
   app.useGlobalFilters(new HttpExceptionFilter());
 
+  // Graceful shutdown
+  const logger = new Logger('Bootstrap');
+  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
+
+  for (const signal of signals) {
+    process.on(signal, async () => {
+      logger.log(`Received ${signal}, shutting down gracefully...`);
+      await app.close();
+      logger.log('Application closed');
+      process.exit(0);
+    });
+  }
+
+  process.on('unhandledRejection', (reason) => {
+    logger.error('Unhandled Rejection:', reason);
+  });
+
+  process.on('uncaughtException', (err) => {
+    logger.error('Uncaught Exception:', err);
+    process.exit(1);
+  });
+
   const port = process.env.PORT ?? 3000;
   await app.listen(port);
-
-  const logger = new Logger('Bootstrap');
   logger.log(`Application running on http://localhost:${port}`);
 }
 bootstrap();

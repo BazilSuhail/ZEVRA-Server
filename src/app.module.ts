@@ -5,6 +5,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { RedisModule } from './redis/redis.module';
+import { SharedModule } from './shared/shared.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
 import { CommonModule } from './common/common.module';
@@ -22,12 +23,13 @@ import { AppController } from './app.controller';
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ThrottlerModule.forRoot([
-      { name: 'default', ttl: 60000, limit: 10000 },
-      { name: 'auth', ttl: 60000, limit: 10000 },
-      { name: 'register', ttl: 300000, limit: 10000 },
+      { name: 'default', ttl: 60000, limit: 1000000 },
+      { name: 'auth', ttl: 60000, limit: 1000000 },
+      { name: 'register', ttl: 300000, limit: 1000000 },
     ]),
     DatabaseModule,
     RedisModule,
+    SharedModule,
     JwtModule.register({
       global: true,
       secret: process.env.JWT_SECRET,
