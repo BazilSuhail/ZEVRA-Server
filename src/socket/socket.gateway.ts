@@ -14,7 +14,9 @@ import { SocketService } from './socket.service';
 import { RedisSessionService } from '../redis/redis-session.service';
 import { RedisCacheService } from '../redis/redis-cache.service';
 import { RedisPubSubService } from '../redis/redis-pubsub.service';
+import { RedisService } from '../redis/redis.service';
 import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
+import { createSocketRedisAdapter } from './socket-redis-adapter';
 
 @WebSocketGateway({ cors: true })
 export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -32,10 +34,22 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private cacheService: RedisCacheService,
     private pubSubService: RedisPubSubService,
     private rateLimitService: RateLimitService,
+    private redisService: RedisService,
   ) {}
 
   afterInit() {
     this.socketService.setServer(this.server);
+
+    // Attach Redis adapter for multi-node broadcast
+    const pubClient = this.redisService.getClient();
+    if (pubClient) {
+      const subClient = pubClient.duplicate();
+      this.server.adapter(createSocketRedisAdapter(pubClient, subClient));
+      this.logger.log('Socket.io Redis adapter attached — multi-node enabled');
+    } else {
+      this.logger.warn('Redis unavailable — single-node Socket.io mode');
+    }
+
     this.logger.log('Socket.io gateway initialized');
   }
 
