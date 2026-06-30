@@ -1,10 +1,11 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 import { createNodeRedisClient } from 'bullmq';
 import { KeyRotationProcessor } from './key-rotation.processor';
 import { MessageDeliveryProcessor } from './message-delivery.processor';
 import { ReadReceiptProcessor } from './read-receipt.processor';
 import { DatabaseModule } from '../../database/database.module';
+import { SocketModule } from '../../socket/socket.module';
 
 @Module({
   imports: [
@@ -29,6 +30,7 @@ import { DatabaseModule } from '../../database/database.module';
       { name: 'read-receipt' },
     ),
     DatabaseModule,
+    forwardRef(() => SocketModule),
   ],
   providers: [
     KeyRotationProcessor,

@@ -4,12 +4,14 @@ import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { channels, memberships, messages, users, messageReads } from '../../database/schema';
 import { eq, and, sql, desc } from 'drizzle-orm';
 import { RedisSessionService } from '../../redis/redis-session.service';
+import { RedisCacheService } from '../../redis/redis-cache.service';
 
 @Injectable()
 export class ChannelsService {
   constructor(
     @Inject(DB) private db: NodePgDatabase,
     private sessionService: RedisSessionService,
+    private cacheService: RedisCacheService,
   ) {}
 
   async create(userId: string, participantIds: string[], type: string, name?: string) {
@@ -405,5 +407,49 @@ export class ChannelsService {
       .where(eq(channels.id, channelId));
 
     return { isArchived: newArchivedState };
+  }
+
+  // ─── Typing Users ──────────────────────────────────────────────────────
+
+  async getTypingUsers(channelId: string, userId: string) {
+    // Verify membership
+    const [membership] = await this.db
+      .select({ id: memberships.id })
+      .from(memberships)
+      .where(
+        and(
+          eq(memberships.userId, userId),
+          eq(memberships.channelId, channelId),
+        ),
+      );
+
+    if (!membership) {
+      throw new ForbiddenException('Not a member of this channel');
+    }
+
+    const typingUserIds = await this.cacheService.getTypingUsers(channelId);
+    // Exclude the requesting user
+    return typingUserIds.filter((id) => id !== userId);
+  }
+
+  // ─── Read Receipts ────────────────────────────────────────────────────
+
+  async getReadReceipts(channelId: string, userId: string) {
+    // Verify membership
+    const [membership] = await this.db
+      .select({ id: memberships.id })
+      .from(memberships)
+      .where(
+        and(
+          eq(memberships.userId, userId),
+          eq(memberships.channelId, channelId),
+        ),
+      );
+
+    if (!membership) {
+      throw new ForbiddenException('Not a member of this channel');
+    }
+
+    return this.cacheService.getReadReceipts(channelId);
   }
 }

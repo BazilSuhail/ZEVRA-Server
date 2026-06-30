@@ -61,4 +61,20 @@ export class ChannelsController {
   ) {
     return this.channelsService.markRead(userId, body.channelId, body.lastReadMessageId);
   }
+
+  @Get(':channelId/typing')
+  getTypingUsers(
+    @CurrentUser('id') userId: string,
+    @Param('channelId') channelId: string,
+  ) {
+    return this.channelsService.getTypingUsers(channelId, userId);
+  }
+
+  @Get(':channelId/read-receipts')
+  getReadReceipts(
+    @CurrentUser('id') userId: string,
+    @Param('channelId') channelId: string,
+  ) {
+    return this.channelsService.getReadReceipts(channelId, userId);
+  }
 }
