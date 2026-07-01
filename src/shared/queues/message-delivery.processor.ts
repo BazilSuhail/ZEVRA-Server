@@ -11,6 +11,8 @@ import { RedisCacheService } from '../../redis/redis-cache.service';
 import { RedisPubSubService } from '../../redis/redis-pubsub.service';
 import { SocketService } from '../../socket/socket.service';
 
+const BATCH_SIZE = 100;
+
 export interface MessageDeliveryJob {
   messageId: string;
   channelId: string;
@@ -89,28 +91,32 @@ export class MessageDeliveryProcessor extends WorkerHost {
     // 2. Check online status for all members
     const onlineUsers = await this.sessionService.getOnlineUsers(members);
 
-    // 3. Deliver to each member (skip sender)
+    // 3. Deliver in batches (skip sender)
     let delivered = 0;
     let queued = 0;
 
-    const deliveryPromises = members.map(async (memberId) => {
-      if (memberId === senderId) return;
+    const recipients = members.filter((id) => id !== senderId);
 
-      if (onlineUsers.has(memberId)) {
-        // Online: emit directly via Socket.io
-        const sent = await this.socketService.emitToUser(memberId, 'message:new', payload);
-        if (sent) delivered++;
-      } else {
-        // Offline: queue for later delivery
-        await this.sessionService.addPendingMessage(memberId, payload);
-        queued++;
-      }
+    for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+      const batch = recipients.slice(i, i + BATCH_SIZE);
 
-      // Increment unread count (non-blocking)
-      await this.cacheService.incrementUnread(memberId, channelId);
-    });
+      const results = await Promise.allSettled(
+        batch.map(async (memberId) => {
+          if (onlineUsers.has(memberId)) {
+            const sent = await this.socketService.emitToUser(memberId, 'message:new', payload);
+            if (sent) delivered++;
+          } else {
+            await this.sessionService.addPendingMessage(memberId, payload);
+            queued++;
+          }
+          await this.cacheService.incrementUnread(memberId, channelId);
+        }),
+      );
 
-    await Promise.allSettled(deliveryPromises);
+      this.logger.debug(
+        `Batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} members processed`,
+      );
+    }
 
     // 4. Publish to Redis PubSub (cross-node fan-out)
     //    Note: No broadcastToChannel here — emitToUser already handles online users on this node.
