@@ -97,6 +97,16 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     await this.sessionService.registerSession(user.id, client.id);
     await this.sessionService.setOnline(user.id);
 
+    // Auto-join all channel rooms (needed for typing, reactions, read receipts)
+    this.chatService.getUserChannelIds(user.id).then((channelIds) => {
+      for (const channelId of channelIds) {
+        client.join(`channel:${channelId}`);
+      }
+      this.logger.debug(`Auto-joined ${channelIds.length} channels for ${user.username}`);
+    }).catch((err) =>
+      this.logger.warn(`Auto-join channels failed: ${(err as Error).message}`),
+    );
+
     // Auto-deliver pending messages from previous session
     this.chatService.deliverPendingMessages(user.id).catch((err) =>
       this.logger.warn(`Auto-deliver pending failed: ${(err as Error).message}`),
@@ -142,6 +152,41 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
       await this.sessionService.removeSession(user.id, client.id);
       await this.sessionService.setOffline(user.id);
       await this.pubSubService.unsubscribeFromUser(user.id);
+    }
+  }
+
+  // ─── Create or Join Channel ──────────────────────────────────────────
+
+  @UseGuards(SocketAuthGuard)
+  @SubscribeMessage('create-or-join')
+  async handleCreateOrJoin(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { participantIds: string[]; type: string; name?: string },
+  ) {
+    const user: SocketUser = client.data.user;
+
+    try {
+      const result = await this.chatService.createOrJoinChannel(
+        user.id,
+        data.participantIds,
+        data.type,
+        data.name,
+      );
+
+      // Auto-join the room
+      this.socketService.joinChannel(client, result.channelId);
+
+      // Notify channel
+      this.server.to(`channel:${result.channelId}`).emit('user:joined', {
+        userId: user.id,
+        username: user.username,
+        channelId: result.channelId,
+      });
+
+      return { success: true, channelId: result.channelId, created: result.created };
+    } catch (err) {
+      const error = err as any;
+      return { success: false, error: error?.message };
     }
   }
 

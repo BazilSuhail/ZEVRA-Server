@@ -31,9 +31,10 @@ The `SocketAuthGuard` verifies the JWT during handshake. If invalid, the connect
    b. Single-session enforcement (kicks old socket if exists)
    c. Register session in Redis (session:{userId} ↔ socket:{socketId}, 10min TTL)
    d. Set presence online in Redis (30s TTL)
-   e. Subscribe to user PubSub channel (cross-node messages)
-   f. Start 30-second heartbeat interval
-   g. Emit 'connected' to client
+   e. Auto-deliver pending messages from previous session (fire-and-forget)
+   f. Subscribe to user PubSub channel (cross-node messages)
+   g. Start 30-second heartbeat interval
+   h. Emit 'connected' to client
 4. Client is ready
 ```
 
@@ -61,6 +62,40 @@ The client can also send a `heartbeat` event to trigger an immediate renewal.
 ---
 
 ## Client → Server Events
+
+### `create-or-join`
+
+Create a channel if it doesn't exist, or find the existing one (for DMs). Auto-joins the Socket.io room. This is the primary way clients start conversations — one event handles everything.
+
+**Payload:**
+```json
+{
+  "participantIds": ["uuid-of-other-user"],
+  "type": "DIRECT",
+  "name": null
+}
+```
+
+- `type`: `DIRECT` or `GROUP`
+- For DMs: exactly 1 participant. If DM already exists between these users, returns the existing channel.
+- For GROUPs: any number of participants. Creator becomes ADMIN.
+
+**Response (success):**
+```json
+{
+  "success": true,
+  "channelId": "uuid",
+  "created": true
+}
+```
+
+`created: false` if an existing DM was reused.
+
+**Side effects:**
+- Auto-joins the Socket.io room for the channel
+- Broadcasts `user:joined` to all other members
+
+---
 
 ### `join-channel`
 
@@ -104,6 +139,7 @@ Indicate the user is typing. Rate-limited (200/second per user).
 **Side effects:**
 - Stores in Redis with 5-second TTL (`typing:{channelId}:{userId}`)
 - Broadcasts `typing:start` to all other members in the channel room
+- Schedules a 6-second auto-timeout: if the client doesn't send `typing:stop`, the server broadcasts `typing:stop` automatically
 
 ---
 
@@ -272,6 +308,54 @@ Deliver pending offline messages and clear the queue.
 
 ---
 
+### `reaction:add`
+
+Add an emoji reaction to a message. Rate-limited.
+
+**Payload:**
+```json
+{
+  "channelId": "uuid",
+  "messageId": "uuid",
+  "emoji": "👍"
+}
+```
+
+**Response:**
+```json
+{ "success": true, "action": "added" }
+```
+
+**Side effects:**
+- Broadcasts `reaction:added` to all other members in the channel room
+- Cross-node via Redis PubSub
+
+---
+
+### `reaction:remove`
+
+Remove an emoji reaction from a message. Rate-limited.
+
+**Payload:**
+```json
+{
+  "channelId": "uuid",
+  "messageId": "uuid",
+  "emoji": "👍"
+}
+```
+
+**Response:**
+```json
+{ "success": true, "action": "removed" }
+```
+
+**Side effects:**
+- Broadcasts `reaction:removed` to all other members in the channel room
+- Cross-node via Redis PubSub
+
+---
+
 ### `heartbeat`
 
 Client-initiated heartbeat (optional — server also sends heartbeats automatically).
@@ -427,6 +511,38 @@ User stopped typing.
 
 ---
 
+### `reaction:added`
+
+A reaction was added to a message.
+
+```json
+{
+  "userId": "uuid",
+  "username": "alice",
+  "messageId": "uuid",
+  "emoji": "👍",
+  "channelId": "uuid"
+}
+```
+
+---
+
+### `reaction:removed`
+
+A reaction was removed from a message.
+
+```json
+{
+  "userId": "uuid",
+  "username": "alice",
+  "messageId": "uuid",
+  "emoji": "👍",
+  "channelId": "uuid"
+}
+```
+
+---
+
 ### `messages:pending`
 
 Pending offline messages delivered on reconnect.
@@ -467,6 +583,9 @@ With the Redis adapter attached, Socket.io rooms are synchronized across server 
 - **Application-level:** `RedisPubSubService` handles `group:{id}:channel` and `user:{id}:channel` patterns for custom cross-node fan-out
 
 When a message is sent:
-1. The BullMQ worker on the originating node broadcasts to the local Socket.io room
-2. The worker also publishes to Redis PubSub (`group:{channelId}:channel`)
-3. Other nodes receive the PubSub message and broadcast to their local Socket.io rooms
+1. The BullMQ worker delivers directly to online users via `SocketService.emitToUser()` (Redis session lookup)
+2. Offline users get the message queued in Redis pending list
+3. The worker publishes to Redis PubSub (`group:{channelId}:channel`)
+4. Remote nodes receive the PubSub message and broadcast to their local Socket.io rooms
+
+**Duplicate delivery prevention:** The `emitToUser()` call handles all online users on the originating node directly. The local `broadcastToChannel` is NOT called from the delivery processor — this avoids sending duplicate `message:new` events to local users. Cross-node delivery is handled exclusively by PubSub.

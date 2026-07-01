@@ -27,10 +27,10 @@ ZEVRA (Zero-knowledge Events Verified Realtime Architecture) is an end-to-end en
 │  ┌─────────────────────────────────────────────────────────┐ │
 │  │  WebSocket Pipeline                                     │ │
 │  │  SocketAuthGuard (JWT) → Gateway → Service              │ │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │ │
-│  │  │ Socket   │  │ Chat     │  │ Typing/  │              │ │
-│  │  │ Gateway  │  │ Gateway  │  │ Presence │              │ │
-│  │  └──────────┘  └──────────┘  └──────────┘              │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐│ │
+│  │  │ Socket   │  │ Chat     │  │ Typing/  │  │ Reactions││ │
+│  │  │ Gateway  │  │ Gateway  │  │ Presence │  │ (socket) ││ │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘│ │
 │  └─────────────────────────────────────────────────────────┘ │
 │                                                               │
 │  ┌─────────────────────────────────────────────────────────┐ │
@@ -54,7 +54,8 @@ ZEVRA (Zero-knowledge Events Verified Realtime Architecture) is an end-to-end en
 │  sender_keys         │          │  Channel members (SET)     │
 │  pending_messages    │          │  Pending msgs (sorted set) │
 │  refresh_tokens      │          │  Typing (5s TTL)           │
-│  audit_log           │          │  Read receipts (5min TTL)  │
+│  reactions           │          │  Read receipts (5min TTL)  │
+│  audit_log           │          │  Socket.io adapter          │
 └──────────────────────┘          │  Socket.io adapter          │
                                   └──────────────────────────┘
 ```
@@ -73,6 +74,8 @@ AppModule (root)
 ├── ChannelsModule         → Channel CRUD, membership, typing, receipts
 ├── KeysModule             → Public keys, sender keys, rotation
 ├── AuditModule            → Audit log queries
+├── ReactionsModule        → Emoji reactions (add/remove/get, REST + socket)
+├── UploadsModule          → Cloudinary file/image uploads (REST)
 ├── ChatModule             → High-level orchestration (cache-first reads, BullMQ dispatch)
 ├── SocketModule           → WebSocket gateway, sessions, presence, Redis adapter
 └── QueuesModule           → BullMQ workers (message-delivery, read-receipt, key-rotation)
@@ -99,8 +102,23 @@ Client → Helmet → CORS → RequestIdMiddleware → ThrottlerGuard
 Client → SocketAuthGuard (JWT verify) → SocketGateway.handleConnection()
       → IP rate limit check → Single-session enforcement
       → Register session in Redis → Set presence online
+      → Auto-join all channel rooms (for typing, reactions, read receipts)
+      → Auto-deliver pending messages (fire-and-forget)
       → Subscribe to user PubSub channel → Start 30s heartbeat
       → Emit 'connected' to client
+```
+
+### Complete Client Flow
+
+```
+1. Client connects once via WebSocket (JWT in handshake)
+2. Server auto-joins all existing channel rooms
+3. To start a conversation:
+   a. Client emits 'create-or-join' with participantIds + type
+   b. Server creates channel if needed, auto-joins the room
+   c. Server broadcasts 'user:joined' to other members
+4. All events (typing, reactions, read receipts) flow automatically
+5. On disconnect/reconnect, pending messages are auto-delivered
 ```
 
 - `SocketAuthGuard`: Verifies JWT from `handshake.auth.token` or `Authorization` header. Rejects with `NO_TOKEN`, `TOKEN_EXPIRED`, `INVALID_TOKEN`, `USER_NOT_FOUND`.
@@ -122,12 +140,13 @@ Client emits 'send-message'
         → MessageDeliveryProcessor
           → Get channel members (Redis SET → Postgres fallback)
           → Check online status (Redis MGET)
-          → Online members: SocketService.emitToUser('message:new')
+          → Online members: SocketService.emitToUser('message:new') (direct, no local room broadcast)
           → Offline members: RedisSessionService.addPendingMessage()
           → Increment unread counts (Redis INCR)
-          → broadcastToChannel (Socket.io room)
-          → publishToGroup (Redis PubSub for cross-node)
+          → publishToGroup (Redis PubSub for cross-node only)
 ```
+
+**Note:** Online users on the originating node receive the message via `emitToUser()` (direct socket emit). Cross-node delivery is handled by Redis PubSub → `handlePubSubMessage` → `broadcastToChannel` on remote nodes. No local `broadcastToChannel` is called from the delivery processor to avoid duplicate delivery.
 
 ### Message Receive Flow
 
@@ -140,11 +159,14 @@ Server emits 'message:new' to client
 ### Offline Message Delivery Flow
 
 ```
-Client reconnects → emits 'get-pending'
-  → ChatService.deliverPendingMessages()
-    → RedisSessionService.getPendingMessages() (ZREVRANGE)
-    → Emit 'messages:pending' to user
-    → RedisSessionService.clearPendingMessages() (DEL)
+Client reconnects
+  → SocketGateway.handleConnection() auto-calls:
+    → ChatService.deliverPendingMessages(userId)
+      → RedisSessionService.getPendingMessages() (ZREVRANGE)
+      → Emit 'messages:pending' to user
+      → RedisSessionService.clearPendingMessages() (DEL)
+
+Client can also manually emit 'get-pending' for on-demand delivery.
 ```
 
 ### Read Receipt Flow
@@ -162,7 +184,47 @@ Client emits 'mark-read'
           → publishToGroup (Redis PubSub for cross-node)
 ```
 
-## Key Design Decisions & Tradeoffs
+### Reaction Flow
+
+```
+Client emits 'reaction:add' (or REST POST /reactions)
+  → ChatGateway → ReactionsService.addReaction()
+    → Verify channel membership
+    → INSERT reaction (idempotent — unique constraint on message+user+emoji)
+    → Broadcast 'reaction:added' to channel room
+    → publishToGroup (Redis PubSub for cross-node)
+```
+
+Reactions are stored as plaintext (emoji is not encrypted). This is standard for E2EE apps — reactions are metadata, not message content.
+
+### Typing Auto-Timeout Flow
+
+```
+Client emits 'typing:start'
+  → SocketGateway.handleTypingStart()
+    → Store in Redis (5s TTL)
+    → Broadcast 'typing:start' to channel room
+    → setTimeout(6s) → broadcast 'typing:stop' automatically
+    → (If client sends 'typing:stop' early, timeout is cleared)
+```
+
+### File Upload Flow
+
+```
+Client uploads file via REST POST /uploads (multipart/form-data)
+  → UploadsController → UploadsService
+    → Validate file type (images: JPEG/PNG/GIF/WebP, files: PDF/DOC/DOCX/TXT)
+    → Validate size (max 10MB)
+    → Upload to Cloudinary
+    → Return { url, publicId, thumbnailUrl (images only) }
+
+Client sends message with metadata:
+  → Client includes metadata.fileUrl, metadata.publicId, etc.
+  → Server stores encrypted metadata alongside encrypted content
+  → Recipients use metadata.fileUrl to download from Cloudinary
+```
+
+**Note:** Files are stored unencrypted on Cloudinary. The server never sees plaintext message content, but file contents are accessible via the Cloudinary URL. For true E2EE file sharing, clients would need to encrypt files before upload and share keys via the existing sender key mechanism.
 
 ### 1. Drizzle ORM over Prisma
 
@@ -253,3 +315,21 @@ BullMQ provides job priorities, retries with exponential backoff, stalled job de
 Redis pub/sub blocks the connection — a subscriber cannot issue other commands. Using separate clients ensures the main client remains available for cache/session operations while pub/sub is active.
 
 **Cost:** 2 additional Redis connections per server instance (publisher + subscriber), on top of the main client, BullMQ connections, and Socket.io adapter connections.
+
+### 11. Plaintext Reactions in E2EE System
+
+**Chosen:** Store reactions (emoji) as plaintext on the server.  
+**Rejected:** Encrypt reactions with sender keys
+
+Reactions are metadata — a 👍 emoji reveals no message content. Encrypting them would require the server to decrypt to group by emoji, defeating the purpose. This is the standard approach used by Signal, WhatsApp, and other E2EE messengers.
+
+**Cost:** Server can see which emoji a user reacted to (but not the message content).
+
+### 12. Auto-Deliver Pending Messages on Reconnect
+
+**Chosen:** Automatically call `deliverPendingMessages()` in `handleConnection()` after session registration (fire-and-forget).  
+**Rejected:** Require client to manually call `get-pending` after connecting
+
+This reduces client complexity and ensures pending messages are delivered immediately on reconnect without waiting for client logic. The call is fire-and-forget (non-blocking) so connection setup is not delayed.
+
+**Cost:** Slightly more server load on reconnect bursts. Client still has `get-pending` as a manual fallback.

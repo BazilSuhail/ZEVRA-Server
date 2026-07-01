@@ -45,6 +45,10 @@ ZEVRA is a secure messaging platform built on the principle that **privacy is a 
 - **Key Rotation** — Async via BullMQ. Client generates new keys, server updates atomically. Brief window where old keys valid (acceptable for infrequent rotation).
 - **Sender Key Ratchet** — Group E2EE with epoch-based key rotation. Keys re-encrypted for each member on rotation.
 - **Graceful Degradation** — All Redis-backed features fail open (allow requests, return safe defaults) when Redis is unavailable.
+- **Emoji Reactions** — Add/remove emoji reactions to messages. Stored plaintext (standard for E2EE). Real-time broadcast via socket events + cross-node PubSub.
+- **File & Image Uploads** — Cloudinary integration. Images auto-optimized with thumbnails. Documents up to 10MB. Metadata sent with encrypted messages.
+- **Auto-Deliver on Reconnect** — Pending offline messages are automatically pushed to clients on reconnect. No manual `get-pending` call needed.
+- **Typing Auto-Timeout** — Server broadcasts `typing:stop` after 6s if client doesn't send it. Prevents stale typing indicators.
 
 ### Technical Stack
 
@@ -52,11 +56,12 @@ ZEVRA is a secure messaging platform built on the principle that **privacy is a 
 |-----------|------------|---------|
 | Runtime | Bun | Fast TypeScript execution |
 | Framework | NestJS 11 | Modular architecture, DI, guards, pipes |
-| Database | PostgreSQL (Neon) | Persistent storage, 9 tables, 12 foreign keys |
+| Database | PostgreSQL (Neon) | Persistent storage, 10 tables, 14 foreign keys |
 | ORM | Drizzle ORM | Type-safe queries, migrations, schema push |
-| Cache/PubSub | Redis (Redis Labs) | 8 distinct roles: sessions, presence, cache, pub/sub, rate limits, channel members, pending msgs, Socket.io adapter |
+| Cache/PubSub | Redis (Redis Labs) | 9 distinct roles: sessions, presence, cache, pub/sub, rate limits, channel members, pending msgs, typing timeouts, Socket.io adapter |
 | Job Queue | BullMQ | 3 queues: message-delivery (10 workers), read-receipt (5 workers), key-rotation (1 worker) |
 | Realtime | Socket.io v4 | WebSocket gateway with Redis adapter for multi-node |
+| File Storage | Cloudinary | Image optimization, thumbnails, raw file uploads |
 | Auth | SRP-6a + JWT | Zero-knowledge password proof + 15min access tokens + 7d refresh tokens |
 | Crypto | Argon2id + X25519 + Ed25519 + AES-256-GCM | KDF, key exchange, signing, authenticated encryption |
 | Security | Helmet + Rate Limiter + Circuit Breaker | HTTP headers, sliding window limits, failure isolation |

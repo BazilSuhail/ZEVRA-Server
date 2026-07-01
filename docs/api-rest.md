@@ -708,6 +708,148 @@ Returns all sender keys for the group (admin/debug use).
 
 ---
 
+## Reactions
+
+### `POST /reactions`
+
+**Auth:** Bearer JWT  
+**Rate limit:** 60 per minute
+
+**Body:**
+```json
+{
+  "channelId": "uuid",
+  "messageId": "uuid",
+  "emoji": "👍"
+}
+```
+
+Adds a reaction to a message. Idempotent — returns `already_exists` if the user already reacted with the same emoji.
+
+**Response:** `201 Created`
+```json
+{ "success": true, "action": "added" }
+```
+
+**Errors:** `403 Forbidden` — not a member of the channel.
+
+---
+
+### `DELETE /reactions`
+
+**Auth:** Bearer JWT  
+**Rate limit:** 60 per minute
+
+**Body:**
+```json
+{
+  "channelId": "uuid",
+  "messageId": "uuid",
+  "emoji": "👍"
+}
+```
+
+Removes a specific reaction from a message.
+
+**Response:** `200 OK`
+```json
+{ "success": true, "action": "removed" }
+```
+
+---
+
+### `GET /reactions?messageId=uuid&channelId=uuid`
+
+**Auth:** Bearer JWT  
+**Rate limit:** 60 per minute
+
+Returns all reactions for a message, grouped by emoji.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "emoji": "👍",
+    "userIds": ["uuid-user-1", "uuid-user-2"],
+    "count": 2
+  },
+  {
+    "emoji": "❤️",
+    "userIds": ["uuid-user-3"],
+    "count": 1
+  }
+]
+```
+
+---
+
+## Uploads
+
+### `POST /uploads`
+
+**Auth:** Bearer JWT  
+**Rate limit:** 60 per minute  
+**Content-Type:** `multipart/form-data`
+
+**Body:** `file` field with the file to upload.
+
+**Allowed types:**
+- Images: JPEG, PNG, GIF, WebP (up to 10MB)
+- Documents: PDF, DOC, DOCX, TXT (up to 10MB)
+
+Images are uploaded to Cloudinary with auto-quality and format optimization. A 200x200 face-centered thumbnail is auto-generated for images.
+
+**Response:** `201 Created`
+```json
+{
+  "url": "https://res.cloudinary.com/dfdf/image/upload/v1234567890/zevra/uploads/abc123.jpg",
+  "publicId": "zevra/uploads/abc123",
+  "format": "jpg",
+  "resourceType": "image",
+  "bytes": 45230,
+  "width": 1920,
+  "height": 1080,
+  "thumbnailUrl": "https://res.cloudinary.com/dfdf/image/upload/c_fill,h_200,w_200/zevra/uploads/abc123"
+}
+```
+
+For non-image files:
+```json
+{
+  "url": "https://res.cloudinary.com/dfdf/raw/upload/v1234567890/zevra/uploads/doc456.pdf",
+  "publicId": "zevra/uploads/doc456",
+  "format": "pdf",
+  "resourceType": "raw",
+  "bytes": 102400
+}
+```
+
+**Errors:** `400 Bad Request` — unsupported file type or no file provided. `413 Payload Too Large` — file exceeds 10MB.
+
+**Usage with messaging:** After uploading, send a message with `messageType: "IMAGE"` or `"FILE"` and include metadata:
+```json
+{
+  "channelId": "uuid",
+  "encryptedContent": "encrypted-filename-or-caption",
+  "contentIv": "...",
+  "contentTag": "...",
+  "signature": "...",
+  "sequenceNumber": 43,
+  "senderKeyEpoch": 1,
+  "messageType": "IMAGE",
+  "metadata": {
+    "fileUrl": "https://res.cloudinary.com/.../image.jpg",
+    "publicId": "zevra/uploads/abc123",
+    "fileName": "photo.jpg",
+    "fileSize": 45230,
+    "mimeType": "image/jpeg",
+    "thumbnailUrl": "https://res.cloudinary.com/.../thumb.jpg"
+  }
+}
+```
+
+---
+
 ## Audit
 
 ### `GET /api/audit/logs`

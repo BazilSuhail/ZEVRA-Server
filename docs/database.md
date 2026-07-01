@@ -161,6 +161,21 @@ PostgreSQL (Neon) via Drizzle ORM. Schema defined in `src/database/schema.ts`, m
 
 **Index:** `idx_audit_log_user_created` on (user_id, created_at)
 
+---
+
+### `reactions`
+
+| Column | Type | Default | Notes |
+|--------|------|---------|-------|
+| `id` | uuid | `gen_random_uuid()` | PK |
+| `emoji` | varchar(8) | | Unicode emoji (1-4 bytes) |
+| `created_at` | timestamp | `now()` | |
+| `message_id` | uuid | | FK → messages (CASCADE) |
+| `user_id` | uuid | | FK → users (CASCADE) |
+
+**Unique:** `idx_reactions_message_user_emoji` on (message_id, user_id, emoji) — one reaction per emoji per user per message  
+**Index:** `idx_reactions_message` on (message_id) — fast lookup for message reactions
+
 ## Relationships
 
 ```
@@ -171,16 +186,18 @@ users ─┬─< memberships          (1:N, CASCADE)
        ├─< refresh_tokens       (1:N, CASCADE)
        ├─< sender_keys.owner    (1:N, CASCADE)
        ├─< sender_keys.receiver (1:N, CASCADE)
+       ├─< reactions            (1:N, CASCADE)
        └─< audit_log            (1:N, SET NULL)
 
 channels ─┬─< memberships      (1:N, CASCADE)
            └─< messages         (1:N, CASCADE)
 
 messages ─┬─< message_reads     (1:N, CASCADE)
-          └─< pending_messages  (1:N, CASCADE)
+          ├─< pending_messages  (1:N, CASCADE)
+          └─< reactions         (1:N, CASCADE)
 ```
 
-**12 foreign keys total.** All CASCADE except `audit_log.user_id` (SET NULL).
+**14 foreign keys total.** All CASCADE except `audit_log.user_id` (SET NULL).
 
 **Implicit references (no FK constraint):**
 - `channels.last_message_id` → `messages.id`
@@ -193,6 +210,7 @@ messages ─┬─< message_reads     (1:N, CASCADE)
 |-----------|-------------|
 | `0000_productive_outlaw_kid.sql` | Initial schema: all tables created |
 | `0001_drop_participant_ids_add_pending_messages.sql` | Drop `participant_ids text[]` from channels; add `pending_messages` table |
+| *(pending)* | Add `reactions` table |
 
 ## Key Query Patterns
 
@@ -232,4 +250,14 @@ LIMIT $limit + 1;   -- extra row to determine hasMore
 -- Only advance if the new message is newer than current read position:
 SELECT created_at FROM messages WHERE id = $currentReadMessageId;
 -- If current.createdAt >= newMsg.createdAt → skip (no regression)
+```
+
+### Reactions (grouped by emoji)
+
+```sql
+-- Get all reactions for a message, grouped by emoji:
+SELECT emoji, array_agg(user_id) AS user_ids, COUNT(*) AS count
+FROM reactions
+WHERE message_id = $1
+GROUP BY emoji;
 ```

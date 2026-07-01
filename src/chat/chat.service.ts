@@ -2,8 +2,8 @@ import { Injectable, Logger, ForbiddenException } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { messages, memberships, pendingMessages } from '../database/schema';
-import { eq, and, lt, desc } from 'drizzle-orm';
+import { messages, memberships, pendingMessages, channels } from '../database/schema';
+import { eq, and, lt, desc, sql } from 'drizzle-orm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { MessagesService } from '../modules/messages/messages.service';
@@ -302,5 +302,66 @@ export class ChatService {
     } catch (err) {
       this.logger.warn(`handlePubSubMessage failed: ${(err as Error).message}`);
     }
+  }
+
+  async getUserChannelIds(userId: string): Promise<string[]> {
+    const rows = await this.db
+      .select({ channelId: memberships.channelId })
+      .from(memberships)
+      .where(eq(memberships.userId, userId));
+    return rows.map((r) => r.channelId);
+  }
+
+  async createOrJoinChannel(userId: string, participantIds: string[], type: string, name?: string) {
+    if (type === 'DIRECT' && participantIds.length !== 1) {
+      throw new ForbiddenException('Direct message requires exactly 1 other participant');
+    }
+    if (type === 'DIRECT' && participantIds[0] === userId) {
+      throw new ForbiddenException('Cannot DM yourself');
+    }
+
+    // DM: find existing channel with both users
+    if (type === 'DIRECT') {
+      const targetUserId = participantIds[0];
+      const existing = await this.db
+        .select({ channelId: memberships.channelId })
+        .from(memberships)
+        .innerJoin(channels, eq(channels.id, memberships.channelId))
+        .where(
+          and(
+            eq(channels.type, 'DIRECT'),
+            sql`${memberships.userId} IN (${userId}, ${targetUserId})`,
+          ),
+        )
+        .groupBy(memberships.channelId)
+        .having(sql`COUNT(*) = 2`);
+
+      if (existing.length > 0) {
+        return { channelId: existing[0].channelId, created: false };
+      }
+    }
+
+    // Create channel
+    const allParticipants = [userId, ...participantIds];
+    const [channel] = await this.db
+      .insert(channels)
+      .values({ type, name: name ?? null })
+      .returning({ id: channels.id });
+
+    // Create memberships
+    await this.db.insert(memberships).values(
+      allParticipants.map((uid) => ({
+        userId: uid,
+        channelId: channel.id,
+        role: uid === userId ? 'ADMIN' : 'MEMBER',
+      })),
+    );
+
+    // Cache in Redis
+    for (const uid of allParticipants) {
+      await this.sessionService.addChannelMember(channel.id, uid);
+    }
+
+    return { channelId: channel.id, created: true };
   }
 }
