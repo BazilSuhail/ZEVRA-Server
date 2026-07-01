@@ -16,7 +16,7 @@
       "*": ["./*"]
     },
     "incremental": true,
-    "types": ["node"],
+    "types": ["node", "multer"],
     "skipLibCheck": true,
     "strictNullChecks": true,
     "forceConsistentCasingInFileNames": true,

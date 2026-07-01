@@ -291,9 +291,12 @@ export class ChatService {
       const parsed = JSON.parse(message);
       const { event, data } = parsed;
 
-      if (event === 'message:new') {
-        this.socketService.broadcastToChannel(channelId, event, data);
-      } else if (event === 'message:read') {
+      if (
+        event === 'message:new' ||
+        event === 'message:read' ||
+        event === 'reaction:added' ||
+        event === 'reaction:removed'
+      ) {
         this.socketService.broadcastToChannel(channelId, event, data);
       }
     } catch (err) {

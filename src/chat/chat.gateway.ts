@@ -8,7 +8,9 @@ import {
 import { Logger, UseGuards } from '@nestjs/common';
 import { Socket } from 'socket.io';
 import { SocketAuthGuard, SocketUser } from '../socket/socket-auth.guard';
+import { SocketService } from '../socket/socket.service';
 import { ChatService } from './chat.service';
+import { ReactionsService } from '../modules/reactions/reactions.service';
 import { RedisPubSubService } from '../redis/redis-pubsub.service';
 import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
 
@@ -20,6 +22,8 @@ export class ChatGateway implements OnGatewayInit {
 
   constructor(
     private chatService: ChatService,
+    private socketService: SocketService,
+    private reactionsService: ReactionsService,
     private pubSubService: RedisPubSubService,
     private rateLimitService: RateLimitService,
   ) {}
@@ -145,6 +149,86 @@ export class ChatGateway implements OnGatewayInit {
     const user: SocketUser = client.data.user;
     const pending = await this.chatService.deliverPendingMessages(user.id);
     return { success: true, count: pending.length, messages: pending };
+  }
+
+  // ─── Reactions ─────────────────────────────────────────────────────────
+
+  @UseGuards(SocketAuthGuard)
+  @SubscribeMessage('reaction:add')
+  async handleReactionAdd(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { channelId: string; messageId: string; emoji: string },
+  ) {
+    const user: SocketUser = client.data.user;
+
+    try {
+      const result = await this.reactionsService.addReaction(
+        user.id,
+        data.channelId,
+        data.messageId,
+        data.emoji,
+      );
+
+      if (result.action === 'added') {
+        // Broadcast to channel room
+        const reaction = {
+          userId: user.id,
+          username: user.username,
+          messageId: data.messageId,
+          emoji: data.emoji,
+          channelId: data.channelId,
+        };
+        client.to(`channel:${data.channelId}`).emit('reaction:added', reaction);
+
+        // Cross-node via PubSub
+        await this.pubSubService.publishToGroup(data.channelId, JSON.stringify({
+          event: 'reaction:added',
+          data: reaction,
+        }));
+      }
+
+      return result;
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  }
+
+  @UseGuards(SocketAuthGuard)
+  @SubscribeMessage('reaction:remove')
+  async handleReactionRemove(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { channelId: string; messageId: string; emoji: string },
+  ) {
+    const user: SocketUser = client.data.user;
+
+    try {
+      const result = await this.reactionsService.removeReaction(
+        user.id,
+        data.channelId,
+        data.messageId,
+        data.emoji,
+      );
+
+      if (result.action === 'removed') {
+        const reaction = {
+          userId: user.id,
+          username: user.username,
+          messageId: data.messageId,
+          emoji: data.emoji,
+          channelId: data.channelId,
+        };
+        client.to(`channel:${data.channelId}`).emit('reaction:removed', reaction);
+
+        await this.pubSubService.publishToGroup(data.channelId, JSON.stringify({
+          event: 'reaction:removed',
+          data: reaction,
+        }));
+      }
+
+      return result;
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
   }
 
   // ─── Private: Subscribe to Group Channels ──────────────────────────────

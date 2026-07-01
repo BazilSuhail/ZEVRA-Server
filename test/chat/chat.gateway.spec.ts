@@ -15,7 +15,13 @@ describe('ChatGateway', () => {
       deliverPendingMessages: jest.fn(),
     };
     mockRateLimitService = { checkRateLimit: jest.fn().mockResolvedValue({ allowed: true, remaining: 100 }) };
-    gateway = new ChatGateway(mockChatService, {}, mockRateLimitService);
+    gateway = new ChatGateway(
+      mockChatService,
+      {},  // socketService
+      {},  // reactionsService
+      {},  // pubSubService
+      mockRateLimitService,
+    );
 
     mockClient = {
       id: 'socket-123',

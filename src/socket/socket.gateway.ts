@@ -16,6 +16,7 @@ import { RedisCacheService } from '../redis/redis-cache.service';
 import { RedisPubSubService } from '../redis/redis-pubsub.service';
 import { RedisService } from '../redis/redis.service';
 import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
+import { ChatService } from '../chat/chat.service';
 import { createSocketRedisAdapter } from './socket-redis-adapter';
 
 @WebSocketGateway({ cors: true })
@@ -27,6 +28,7 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private heartbeatIntervals = new Map<string, ReturnType<typeof setInterval>>();
   private ipConnections = new Map<string, Set<string>>();
+  private typingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(
     private socketService: SocketService,
@@ -35,6 +37,7 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private pubSubService: RedisPubSubService,
     private rateLimitService: RateLimitService,
     private redisService: RedisService,
+    private chatService: ChatService,
   ) {}
 
   afterInit() {
@@ -93,6 +96,11 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     await this.sessionService.registerSession(user.id, client.id);
     await this.sessionService.setOnline(user.id);
+
+    // Auto-deliver pending messages from previous session
+    this.chatService.deliverPendingMessages(user.id).catch((err) =>
+      this.logger.warn(`Auto-deliver pending failed: ${(err as Error).message}`),
+    );
 
     await this.pubSubService.subscribeToUser(user.id, (message) => {
       client.emit('user:message', JSON.parse(message));
@@ -204,6 +212,11 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     );
     if (!rl.allowed) return;
 
+    // Clear any existing timeout for this user+channel
+    const timeoutKey = `${user.id}:${data.channelId}`;
+    const existing = this.typingTimeouts.get(timeoutKey);
+    if (existing) clearTimeout(existing);
+
     await this.cacheService.setTyping(data.channelId, user.id);
 
     client.to(`channel:${data.channelId}`).emit('typing:start', {
@@ -211,6 +224,18 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
       username: user.username,
       channelId: data.channelId,
     });
+
+    // Auto-broadcast typing:stop after 6s if client doesn't send it
+    const timeout = setTimeout(async () => {
+      this.typingTimeouts.delete(timeoutKey);
+      await this.cacheService.clearTyping(data.channelId, user.id);
+      client.to(`channel:${data.channelId}`).emit('typing:stop', {
+        userId: user.id,
+        username: user.username,
+        channelId: data.channelId,
+      });
+    }, 6000);
+    this.typingTimeouts.set(timeoutKey, timeout);
   }
 
   @UseGuards(SocketAuthGuard)
@@ -226,6 +251,14 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
       RateLimitService.TYPING,
     );
     if (!rl.allowed) return;
+
+    // Clear the auto-timeout
+    const timeoutKey = `${user.id}:${data.channelId}`;
+    const existing = this.typingTimeouts.get(timeoutKey);
+    if (existing) {
+      clearTimeout(existing);
+      this.typingTimeouts.delete(timeoutKey);
+    }
 
     await this.cacheService.clearTyping(data.channelId, user.id);
 

@@ -217,3 +217,25 @@ export const auditLog = pgTable(
   },
   (t) => [index('idx_audit_log_user_created').on(t.userId, t.createdAt)],
 );
+
+// ─── Reactions ─────────────────────────────────────────────────────────────
+
+export const reactions = pgTable(
+  'reactions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    emoji: varchar('emoji', { length: 8 }).notNull(),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+
+    messageId: uuid('message_id')
+      .notNull()
+      .references(() => messages.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+  },
+  (t) => [
+    uniqueIndex('idx_reactions_message_user_emoji').on(t.messageId, t.userId, t.emoji),
+    index('idx_reactions_message').on(t.messageId),
+  ],
+);

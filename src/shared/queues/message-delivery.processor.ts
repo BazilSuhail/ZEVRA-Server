@@ -112,10 +112,9 @@ export class MessageDeliveryProcessor extends WorkerHost {
 
     await Promise.allSettled(deliveryPromises);
 
-    // 4. Broadcast to channel room (local Socket.io)
-    this.socketService.broadcastToChannel(channelId, 'message:new', payload);
-
-    // 5. Publish to Redis PubSub (cross-node fan-out)
+    // 4. Publish to Redis PubSub (cross-node fan-out)
+    //    Note: No broadcastToChannel here — emitToUser already handles online users on this node.
+    //    Cross-node delivery is handled by PubSub → handlePubSubMessage → broadcastToChannel on remote nodes.
     await this.pubSubService.publishToGroup(channelId, JSON.stringify({
       event: 'message:new',
       data: payload,
