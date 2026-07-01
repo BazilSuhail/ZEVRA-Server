@@ -36,9 +36,9 @@ package-lock.json
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-/docs
+
 # Ignore all markdown files
-*.md
+
 
 # Exception for README
 !README.md
