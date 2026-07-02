@@ -165,68 +165,50 @@ export class ChatService {
   // ─── Mark as Read (sync persist + async broadcast) ─────────────────────
 
   async markAsRead(userId: string, channelId: string, messageId: string) {
-    // 1. Verify membership
-    const [membership] = await this.db
-      .select({ id: memberships.id, lastReadMessageId: memberships.lastReadMessageId })
-      .from(memberships)
-      .where(
-        and(
-          eq(memberships.userId, userId),
-          eq(memberships.channelId, channelId),
-        ),
-      );
+    // Single CTE: verify membership + message exists + only advance forward + update
+    const result = await this.db.execute(sql`
+      WITH membership AS (
+        SELECT id, last_read_message_id
+        FROM memberships
+        WHERE user_id = ${userId} AND channel_id = ${channelId}
+      ),
+      target_msg AS (
+        SELECT id, created_at
+        FROM messages
+        WHERE id = ${messageId} AND channel_id = ${channelId}
+      ),
+      should_advance AS (
+        SELECT m.id AS membership_id
+        FROM membership m
+        JOIN target_msg t ON true
+        WHERE m.last_read_message_id IS NULL
+           OR (
+             SELECT created_at FROM messages WHERE id = m.last_read_message_id
+           ) < t.created_at
+      )
+      UPDATE memberships
+      SET last_read_message_id = ${messageId},
+          last_read_at = now()
+      FROM should_advance sa
+      WHERE memberships.id = sa.membership_id
+      RETURNING memberships.id
+    `);
 
-    if (!membership) {
-      throw new ForbiddenException('Not a member of this channel');
+    if (result.rowCount === 0) {
+      // Not a member, message not found, or already read past this point
+      return { success: true, advanced: false };
     }
 
-    // 2. Verify message exists in channel
-    const [msg] = await this.db
-      .select({ id: messages.id, createdAt: messages.createdAt })
-      .from(messages)
-      .where(
-        and(
-          eq(messages.id, messageId),
-          eq(messages.channelId, channelId),
-        ),
-      );
+    // Insert read receipt (non-blocking, idempotent)
+    await this.db
+      .insert(pendingMessages)
+      .values({ messageId, userId })
+      .onConflictDoNothing();
 
-    if (!msg) return { success: true, advanced: false };
-
-    // 3. Only advance forward
-    if (membership.lastReadMessageId) {
-      const [current] = await this.db
-        .select({ createdAt: messages.createdAt })
-        .from(messages)
-        .where(eq(messages.id, membership.lastReadMessageId));
-
-      if (current && current.createdAt >= msg.createdAt) {
-        return { success: true, advanced: false };
-      }
-    }
-
-    // 4. Update membership + read receipt in transaction
-    await this.db.transaction(async (tx) => {
-      await tx
-        .update(memberships)
-        .set({ lastReadMessageId: messageId, lastReadAt: new Date() })
-        .where(
-          and(
-            eq(memberships.userId, userId),
-            eq(memberships.channelId, channelId),
-          ),
-        );
-
-      await tx
-        .insert(pendingMessages)
-        .values({ messageId, userId })
-        .onConflictDoNothing();
-    });
-
-    // 5. Reset unread count
+    // Reset unread count
     await this.cacheService.resetUnread(userId, channelId);
 
-    // 6. Enqueue async read receipt broadcast via BullMQ
+    // Enqueue async read receipt broadcast
     this.readReceiptQueue.add('broadcast', {
       userId,
       channelId,

@@ -42,10 +42,14 @@ export class MessagesService {
     messageType?: string;
     metadata?: Record<string, unknown>;
   }) {
-    // 1. Verify membership
-    const [membership] = await this.db
-      .select({ id: memberships.id })
+    // 1. Verify membership + get signing key in one query
+    const [member] = await this.db
+      .select({
+        membershipId: memberships.id,
+        publicKeySign: users.publicKeySign,
+      })
       .from(memberships)
+      .innerJoin(users, eq(users.id, memberships.userId))
       .where(
         and(
           eq(memberships.userId, params.userId),
@@ -53,29 +57,22 @@ export class MessagesService {
         ),
       );
 
-    if (!membership) {
+    if (!member) {
       throw new ForbiddenException('Not a member of this channel');
     }
 
     // 2. Verify Ed25519 signature (if provided)
-    if (params.signature && params.signature !== '') {
-      const [sender] = await this.db
-        .select({ publicKeySign: users.publicKeySign })
-        .from(users)
-        .where(eq(users.id, params.userId));
+    if (params.signature && params.signature !== '' && member.publicKeySign) {
+      const messageBytes = Buffer.from(
+        `${params.channelId}:${params.encryptedContent}:${params.sequenceNumber}`,
+        'utf-8',
+      );
+      const signatureBytes = Buffer.from(params.signature, 'base64');
+      const publicKeyBytes = Buffer.from(member.publicKeySign, 'base64');
 
-      if (sender?.publicKeySign) {
-        const messageBytes = Buffer.from(
-          `${params.channelId}:${params.encryptedContent}:${params.sequenceNumber}`,
-          'utf-8',
-        );
-        const signatureBytes = Buffer.from(params.signature, 'base64');
-        const publicKeyBytes = Buffer.from(sender.publicKeySign, 'base64');
-
-        const valid = this.crypto.verify(messageBytes, signatureBytes, publicKeyBytes);
-        if (!valid) {
-          throw new BadRequestException('Invalid message signature');
-        }
+      const valid = this.crypto.verify(messageBytes, signatureBytes, publicKeyBytes);
+      if (!valid) {
+        throw new BadRequestException('Invalid message signature');
       }
     }
 
@@ -160,46 +157,47 @@ export class MessagesService {
   }
 
   async getMessages(channelId: string, userId: string, limit = 50, cursor?: string) {
-    // Verify membership
-    const [membership] = await this.db
-      .select({ id: memberships.id })
-      .from(memberships)
-      .where(
-        and(
-          eq(memberships.userId, userId),
-          eq(memberships.channelId, channelId),
-        ),
-      );
-
-    if (!membership) {
-      throw new ForbiddenException('Not a member of this channel');
-    }
-
-    // Fetch messages (cursor-based pagination)
+    // Build message query conditions
     const conditions = [eq(messages.channelId, channelId)];
     if (cursor) {
       conditions.push(lt(messages.createdAt, new Date(cursor)));
     }
 
-    const result = await this.db
-      .select({
-        id: messages.id,
-        messageType: messages.messageType,
-        encryptedContent: messages.encryptedContent,
-        contentIv: messages.contentIv,
-        contentTag: messages.contentTag,
-        signature: messages.signature,
-        sequenceNumber: messages.sequenceNumber,
-        senderKeyEpoch: messages.senderKeyEpoch,
-        metadata: messages.metadata,
-        isDeleted: messages.isDeleted,
-        createdAt: messages.createdAt,
-        senderId: messages.senderId,
-      })
-      .from(messages)
-      .where(and(...conditions))
-      .orderBy(desc(messages.createdAt))
-      .limit(limit + 1);
+    // Run membership check + message fetch in parallel
+    const [membership, result] = await Promise.all([
+      this.db
+        .select({ id: memberships.id })
+        .from(memberships)
+        .where(
+          and(
+            eq(memberships.userId, userId),
+            eq(memberships.channelId, channelId),
+          ),
+        ),
+      this.db
+        .select({
+          id: messages.id,
+          messageType: messages.messageType,
+          encryptedContent: messages.encryptedContent,
+          contentIv: messages.contentIv,
+          contentTag: messages.contentTag,
+          signature: messages.signature,
+          sequenceNumber: messages.sequenceNumber,
+          senderKeyEpoch: messages.senderKeyEpoch,
+          metadata: messages.metadata,
+          isDeleted: messages.isDeleted,
+          createdAt: messages.createdAt,
+          senderId: messages.senderId,
+        })
+        .from(messages)
+        .where(and(...conditions))
+        .orderBy(desc(messages.createdAt))
+        .limit(limit + 1),
+    ]);
+
+    if (membership.length === 0) {
+      throw new ForbiddenException('Not a member of this channel');
+    }
 
     const hasMore = result.length > limit;
     const data = hasMore ? result.slice(0, limit) : result;
