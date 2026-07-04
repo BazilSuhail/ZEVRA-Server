@@ -4,7 +4,7 @@ import { Job } from 'bullmq';
 import { Inject } from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { users } from '../../database/schema';
+import { users, auditLog } from '../../database/schema';
 import { eq } from 'drizzle-orm';
 
 interface KeyRotationJob {
@@ -56,6 +56,16 @@ export class KeyRotationProcessor extends WorkerHost {
       .returning({ id: users.id, keyVersion: users.keyVersion });
 
     this.logger.log(`Key rotation complete for user ${userId}: v${updated?.keyVersion}`);
+
+    try {
+      await this.db.insert(auditLog).values({
+        action: 'KEY_ROTATE',
+        userId,
+        details: { newKeyVersion },
+      });
+    } catch (err) {
+      this.logger.warn(`Audit log failed for KEY_ROTATE: ${(err as Error).message}`);
+    }
 
     return { success: true, keyVersion: updated?.keyVersion };
   }

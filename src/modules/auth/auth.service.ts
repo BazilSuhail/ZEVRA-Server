@@ -245,6 +245,7 @@ export class AuthService {
   // ─── Logout ──────────────────────────────────────────────────────────────
 
   async logout(userId: string) {
+    await this.audit('LOGOUT', userId);
     await this.db.update(users).set({ status: 'OFFLINE' }).where(eq(users.id, userId));
     await this.db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
     await this.presence.offline(userId);

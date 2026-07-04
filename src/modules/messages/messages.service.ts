@@ -2,7 +2,7 @@ import { Inject, Injectable, ForbiddenException, NotFoundException, BadRequestEx
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { messages, memberships, channels, users } from '../../database/schema';
-import { eq, and, lt, desc, sql } from 'drizzle-orm';
+import { eq, and, lt, desc, asc, sql } from 'drizzle-orm';
 import { CryptoService } from '../../shared/crypto/crypto.service';
 
 @Injectable()
@@ -191,7 +191,7 @@ export class MessagesService {
         })
         .from(messages)
         .where(and(...conditions))
-        .orderBy(desc(messages.createdAt))
+        .orderBy(asc(messages.createdAt))
         .limit(limit + 1),
     ]);
 
@@ -204,7 +204,7 @@ export class MessagesService {
 
     return {
       messages: data,
-      nextCursor: hasMore ? data[data.length - 1].createdAt.toISOString() : null,
+      nextCursor: hasMore ? data[0].createdAt.toISOString() : null,
       hasMore,
     };
   }

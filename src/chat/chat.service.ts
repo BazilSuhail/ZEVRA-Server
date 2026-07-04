@@ -3,7 +3,7 @@ import { Inject } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { messages, memberships, pendingMessages, channels } from '../database/schema';
-import { eq, and, lt, desc, sql } from 'drizzle-orm';
+import { eq, and, lt, desc, asc, sql } from 'drizzle-orm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { MessagesService } from '../modules/messages/messages.service';
@@ -148,7 +148,7 @@ export class ChatService {
       })
       .from(messages)
       .where(and(...conditions))
-      .orderBy(desc(messages.createdAt))
+      .orderBy(asc(messages.createdAt))
       .limit(limit + 1);
 
     const hasMore = result.length > limit;
@@ -156,7 +156,7 @@ export class ChatService {
 
     return {
       messages: data,
-      nextCursor: hasMore ? data[data.length - 1].createdAt.toISOString() : null,
+      nextCursor: hasMore ? data[0].createdAt.toISOString() : null,
       hasMore,
       source: 'database',
     };

@@ -16,8 +16,8 @@ export class RedisCacheService {
     if (!this.client) return;
     try {
       const key = `cache:messages:${channelId}`;
-      await this.client.lPush(key, JSON.stringify(message));
-      await this.client.lTrim(key, 0, maxItems - 1);
+      await this.client.rPush(key, JSON.stringify(message));
+      await this.client.lTrim(key, -maxItems, -1);
       await this.client.expire(key, 86400);
     } catch (err) {
       this.logger.warn(`cacheMessage failed: ${(err as Error).message}`);

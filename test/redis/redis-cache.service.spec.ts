@@ -69,6 +69,10 @@ describe('RedisCacheService', () => {
           if (!listStore.has(key)) listStore.set(key, []);
           listStore.get(key)!.unshift(val);
         }),
+        rPush: jest.fn(async (key: string, val: string) => {
+          if (!listStore.has(key)) listStore.set(key, []);
+          listStore.get(key)!.push(val);
+        }),
         lRange: jest.fn(async (key: string, start: number, stop: number) => {
           const list = listStore.get(key) ?? [];
           return list.slice(start, stop === -1 ? undefined : stop + 1);
@@ -80,12 +84,13 @@ describe('RedisCacheService', () => {
       service.setClient(mockClient);
     });
 
-    it('caches and retrieves messages (newest first)', async () => {
+    it('caches and retrieves messages (oldest first)', async () => {
       await service.cacheMessage('ch1', { id: '1', content: 'hello' });
       await service.cacheMessage('ch1', { id: '2', content: 'world' });
       const msgs = await service.getRecentMessages('ch1', 10);
       expect(msgs).toHaveLength(2);
-      expect(msgs[0]).toEqual({ id: '2', content: 'world' });
+      expect(msgs[0]).toEqual({ id: '1', content: 'hello' });
+      expect(msgs[1]).toEqual({ id: '2', content: 'world' });
     });
 
     it('respects limit', async () => {

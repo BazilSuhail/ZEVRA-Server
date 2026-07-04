@@ -7,7 +7,8 @@ import {
   ConnectedSocket,
   MessageBody,
 } from '@nestjs/websockets';
-import { Logger, UseGuards } from '@nestjs/common';
+import { Logger, UseGuards, Inject } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
 import { SocketAuthGuard, SocketUser } from './socket-auth.guard';
 import { SocketService } from './socket.service';
@@ -18,6 +19,10 @@ import { RedisService } from '../redis/redis.service';
 import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
 import { ChatService } from '../chat/chat.service';
 import { createSocketRedisAdapter } from './socket-redis-adapter';
+import { DB } from '../database/database.module';
+import { NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { users } from '../database/schema';
+import { eq } from 'drizzle-orm';
 
 @WebSocketGateway({ cors: true })
 export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -38,6 +43,8 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private rateLimitService: RateLimitService,
     private redisService: RedisService,
     private chatService: ChatService,
+    private jwt: JwtService,
+    @Inject(DB) private db: NodePgDatabase,
   ) {}
 
   afterInit() {
@@ -58,10 +65,41 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   // ─── Connection ────────────────────────────────────────────────────────
 
-  @UseGuards(SocketAuthGuard)
+  // @UseGuards(SocketAuthGuard) — doesn't reliably block handleConnection in WS gateways
   async handleConnection(@ConnectedSocket() client: Socket) {
-    const user: SocketUser = client.data.user;
+    // Inline auth check
+    let user: SocketUser | undefined;
+
+    const token =
+      client.handshake?.auth?.token ||
+      client.handshake?.headers?.authorization?.slice(7);
+
+    if (token) {
+      try {
+        const payload = await this.jwt.verifyAsync<{ sub: string }>(token);
+        const [found] = await this.db
+          .select({ id: users.id, username: users.username, email: users.email, status: users.status })
+          .from(users)
+          .where(eq(users.id, payload.sub));
+        user = found;
+      } catch {}
+    }
+
+    if (!user) {
+      /* [SOCKET:REJECTED] */
+      this.logger.warn(`[SOCKET:REJECTED] id=${client.id} reason=no_auth`);
+      client.emit('error', { code: 'NOT_AUTHENTICATED', message: 'Authentication required' });
+      client.emit('error', { code: 'NOT_AUTHENTICATED', message: 'Authentication required' });
+      client.disconnect(true);
+      return;
+    }
+
+    client.data.user = user;
+
     const ip = (client.handshake.headers['x-forwarded-for'] as string) || client.handshake.address;
+
+    /* [SOCKET:CONNECT] */
+    this.logger.log(`[SOCKET:CONNECT] id=${client.id} user=${user.id} username=${user.username} ip=${ip}`);
 
     // IP connection rate limit
     const ipKey = `ip:${ip}`;
@@ -130,6 +168,9 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async handleDisconnect(@ConnectedSocket() client: Socket) {
     const user: SocketUser = client.data.user;
     if (!user) return;
+
+    /* [SOCKET:DISCONNECT] */
+    this.logger.log(`[SOCKET:DISCONNECT] id=${client.id} user=${user.id} username=${user.username}`);
 
     this.logger.log(`Client disconnected: ${client.id} (user: ${user.username})`);
 
