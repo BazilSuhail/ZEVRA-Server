@@ -41,7 +41,7 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
     JwtModule.register({
       global: true,
       secret: process.env.JWT_SECRET,
-      signOptions: { expiresIn: '15m' },
+      signOptions: { expiresIn: '10h' }, // originally 15m, increased for dev
     }),
     AuthModule,
     UsersModule,

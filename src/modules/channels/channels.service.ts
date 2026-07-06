@@ -2,7 +2,7 @@ import { Inject, Injectable, ForbiddenException, NotFoundException, ConflictExce
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { channels, memberships, messages, users, messageReads } from '../../database/schema';
-import { eq, and, sql, desc } from 'drizzle-orm';
+import { eq, and, sql, desc, inArray } from 'drizzle-orm';
 import { RedisSessionService } from '../../redis/redis-session.service';
 import { RedisCacheService } from '../../redis/redis-cache.service';
 
@@ -146,7 +146,7 @@ export class ChannelsService {
       .from(channels)
       .leftJoin(messages, eq(channels.lastMessageId, messages.id))
       .leftJoin(users, eq(messages.senderId, users.id))
-      .where(sql`${channels.id} IN ${channelIds}`)
+      .where(inArray(channels.id, channelIds))
       .orderBy(desc(channels.lastMessageAt));
 
     // Attach lastReadMessageId from membership data
