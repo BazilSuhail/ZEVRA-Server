@@ -1,6 +1,5 @@
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { MulterModule } from '@nestjs/platform-express';
 import { APP_GUARD } from '@nestjs/core';
@@ -25,7 +24,6 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
     ThrottlerModule.forRoot([
       { name: 'default', ttl: 60000, limit: 1000000 },
       { name: 'auth', ttl: 60000, limit: 1000000 },
