@@ -17,6 +17,7 @@ import { CallsService, ActiveCall } from './calls.service';
 import { SocketService } from '../../socket/socket.service';
 import { RedisSessionService } from '../../redis/redis-session.service';
 import { RateLimitService } from '../../shared/rate-limit/rate-limit.service';
+import { LivekitService } from '../livekit/livekit.service';
 
 interface SocketUser {
   id: string;
@@ -39,6 +40,7 @@ export class CallsGateway implements OnGatewayDisconnect {
     private socketService: SocketService,
     private sessionService: RedisSessionService,
     private rateLimitService: RateLimitService,
+    private livekitService: LivekitService,
     private jwt: JwtService,
     @Inject(DB) private db: NodePgDatabase,
   ) {}
@@ -326,5 +328,198 @@ export class CallsGateway implements OnGatewayDisconnect {
     });
 
     return { success: true };
+  }
+
+  // ─── call:initiate ────────────────────────────────────────────────────
+
+  @SubscribeMessage('call:initiate')
+  async handleInitiate(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetUserIds: string[]; type: 'DM' | 'GROUP' },
+  ) {
+    const user: SocketUser = client.data.user;
+    if (!user) return { success: false, error: 'NOT_AUTHENTICATED' };
+
+    const rl = await this.rateLimitService.checkRateLimit(
+      `call:${user.id}`,
+      CALL_RATE_LIMIT,
+    );
+    if (!rl.allowed) {
+      return { success: false, error: 'RATE_LIMITED' };
+    }
+
+    // Check caller not already in a call
+    const callerCall = await this.callsService.getActiveCall(user.id);
+    if (callerCall) {
+      return { success: false, error: 'ALREADY_IN_CALL' };
+    }
+
+    // GROUP → always LiveKit
+    if (data.type === 'GROUP') {
+      return this.initiateLiveKitGroupCall(user, data.targetUserIds);
+    }
+
+    // DM → try WebRTC first
+    const targetId = data.targetUserIds[0];
+    if (!targetId) {
+      return { success: false, error: 'NO_TARGET' };
+    }
+
+    const targetCall = await this.callsService.getActiveCall(targetId);
+    if (targetCall) {
+      return { success: false, error: 'TARGET_BUSY' };
+    }
+
+    const isOnline = await this.sessionService.isOnline(targetId);
+    if (!isOnline) {
+      // Target offline → tell client to use LiveKit fallback
+      return { success: false, error: 'TARGET_OFFLINE', fallback: 'LIVEKIT' };
+    }
+
+    // Target online → WebRTC path
+    const call = await this.callsService.createCall(user.id, targetId);
+    const callLogId = await this.callsService.createCallLog(
+      'WEBRTC',
+      user.id,
+      targetId,
+      null,
+    );
+
+    this.socketService.emitToUser(targetId, 'call:incoming', {
+      callId: call.callId,
+      callerId: user.id,
+      callerUsername: user.username,
+    });
+
+    return { success: true, method: 'WEBRTC', callId: call.callId, callLogId };
+  }
+
+  // ─── call:livekit-fallback ────────────────────────────────────────────
+
+  @SubscribeMessage('call:livekit-fallback')
+  async handleLiveKitFallback(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { targetUserIds: string[] },
+  ) {
+    const user: SocketUser = client.data.user;
+    if (!user) return { success: false, error: 'NOT_AUTHENTICATED' };
+
+    if (!this.livekitService.isConfigured) {
+      return { success: false, error: 'LIVEKIT_NOT_CONFIGURED' };
+    }
+
+    // Generate DM room token
+    const targetId = data.targetUserIds[0];
+    if (!targetId) {
+      return { success: false, error: 'NO_TARGET' };
+    }
+
+    const roomName = LivekitService.getDmRoomName(user.id, targetId);
+
+    // Create LiveKit room (2 participants for DM)
+    await this.livekitService.createRoom(roomName, 2);
+
+    // Generate token for caller
+    const token = await this.livekitService.generateToken(roomName, user.id, user.username);
+    if (!token) {
+      return { success: false, error: 'TOKEN_FAILED' };
+    }
+
+    // Notify target to join via LiveKit
+    const targetToken = await this.livekitService.generateToken(roomName, targetId, '');
+    if (targetToken) {
+      this.socketService.emitToUser(targetId, 'livekit:incoming', {
+        roomName,
+        serverUrl: process.env.LIVEKIT_URL,
+        token: targetToken,
+        callerId: user.id,
+        callerUsername: user.username,
+      });
+    }
+
+    return {
+      success: true,
+      method: 'LIVEKIT',
+      roomName,
+      serverUrl: process.env.LIVEKIT_URL,
+      token,
+    };
+  }
+
+  // ─── call:livekit-join-group ──────────────────────────────────────────
+
+  @SubscribeMessage('call:livekit-join-group')
+  async handleLiveKitJoinGroup(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { roomName: string },
+  ) {
+    const user: SocketUser = client.data.user;
+    if (!user) return { success: false, error: 'NOT_AUTHENTICATED' };
+
+    if (!this.livekitService.isConfigured) {
+      return { success: false, error: 'LIVEKIT_NOT_CONFIGURED' };
+    }
+
+    const token = await this.livekitService.generateToken(
+      data.roomName,
+      user.id,
+      user.username,
+    );
+
+    if (!token) {
+      return { success: false, error: 'TOKEN_FAILED' };
+    }
+
+    return {
+      success: true,
+      serverUrl: process.env.LIVEKIT_URL,
+      token,
+      roomName: data.roomName,
+    };
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────────────
+
+  private async initiateLiveKitGroupCall(
+    user: SocketUser,
+    targetUserIds: string[],
+  ) {
+    if (!this.livekitService.isConfigured) {
+      return { success: false, error: 'LIVEKIT_NOT_CONFIGURED' };
+    }
+
+    const roomName = LivekitService.getGroupRoomName();
+    const maxParticipants = Math.min(10, targetUserIds.length + 1);
+
+    await this.livekitService.createRoom(roomName, maxParticipants);
+
+    // Token for creator
+    const creatorToken = await this.livekitService.generateToken(
+      roomName,
+      user.id,
+      user.username,
+    );
+
+    // Notify all participants
+    for (const targetId of targetUserIds) {
+      const targetToken = await this.livekitService.generateToken(roomName, targetId, '');
+      if (targetToken) {
+        this.socketService.emitToUser(targetId, 'livekit:group-invite', {
+          roomName,
+          serverUrl: process.env.LIVEKIT_URL,
+          token: targetToken,
+          creatorId: user.id,
+          creatorUsername: user.username,
+        });
+      }
+    }
+
+    return {
+      success: true,
+      method: 'LIVEKIT',
+      roomName,
+      serverUrl: process.env.LIVEKIT_URL,
+      token: creatorToken,
+    };
   }
 }
