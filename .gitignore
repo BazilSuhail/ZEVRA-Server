@@ -2,6 +2,7 @@
 /dist
 /node_modules
 /build
+/drizzle
 
 # Logs
 logs
@@ -14,6 +15,7 @@ lerna-debug.log*
 package-lock.json
 *.lock
 !bun.lock
+tsconfig.tsbuildinfo
 
 # OS
 .DS_Store

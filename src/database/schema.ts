@@ -239,3 +239,66 @@ export const reactions = pgTable(
     index('idx_reactions_message').on(t.messageId),
   ],
 );
+
+// ─── Call Logs ──────────────────────────────────────────────────────────────
+
+export const callLogs = pgTable(
+  'call_logs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+
+    // Call type
+    type: text('type').notNull(),           // 'WEBRTC' | 'LIVEKIT'
+
+    // 1:1 only (null for group)
+    callerId: uuid('caller_id').references(() => users.id, { onDelete: 'set null' }),
+    calleeId: uuid('callee_id').references(() => users.id, { onDelete: 'set null' }),
+
+    // LiveKit room name
+    roomName: varchar('room_name', { length: 128 }),
+
+    // Timing
+    startedAt: timestamp('started_at').notNull().defaultNow(),
+    endedAt: timestamp('ended_at'),
+    duration: integer('duration'),           // seconds
+
+    // Outcome
+    status: text('status').notNull(),        // 'missed' | 'completed' | 'rejected' | 'cancelled'
+
+    // Channel link (optional)
+    channelId: uuid('channel_id').references(() => channels.id, { onDelete: 'set null' }),
+  },
+  (t) => [
+    index('idx_call_logs_caller').on(t.callerId),
+    index('idx_call_logs_callee').on(t.calleeId),
+    index('idx_call_logs_started').on(t.startedAt),
+  ],
+);
+
+// ─── Call Participants ─────────────────────────────────────────────────────
+
+export const callParticipants = pgTable(
+  'call_participants',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+
+    callLogId: uuid('call_log_id')
+      .notNull()
+      .references(() => callLogs.id, { onDelete: 'cascade' }),
+
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    // Denormalized for fast reads (one query)
+    username: varchar('username', { length: 32 }).notNull(),
+
+    joinedAt: timestamp('joined_at').notNull().defaultNow(),
+    leftAt: timestamp('left_at'),
+    duration: integer('duration'),           // seconds
+  },
+  (t) => [
+    uniqueIndex('idx_cp_call_user').on(t.callLogId, t.userId),
+    index('idx_cp_user').on(t.userId),
+  ],
+);
