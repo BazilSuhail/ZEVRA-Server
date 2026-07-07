@@ -19,6 +19,7 @@ import { ReactionsModule } from './modules/reactions/reactions.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
 import { SocketModule } from './socket/socket.module';
 import { ChatModule } from './chat/chat.module';
+import { CallsModule } from './modules/calls/calls.module';
 import { AppController } from './app.controller';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 
@@ -54,6 +55,7 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
     UploadsModule,
     SocketModule,
     ChatModule,
+    CallsModule,
   ],
   controllers: [AppController],
   providers: [
