@@ -7,10 +7,10 @@
   "license": "UNLICENSED",
   "scripts": {
     "build": "bun run tsc",
-    "start": "bun run dist/main.js",
+    "start": "bun dist/main.js",
     "start:dev": "bun --watch src/main.ts",
     "start:debug": "bunx --bun tsx watch src/main.ts",
-    "start:prod": "bun run dist/main.js"
+    "start:prod": "bun dist/main.js"
   },
   "dependencies": {
     "@nestjs/bullmq": "^11.0.5",

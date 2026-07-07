@@ -23,4 +23,4 @@ COPY --from=builder /app/package.json ./
 USER app
 EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD curl -f http://localhost:5000/health || exit 1
-CMD ["bun", "run", "dist/main.js"]
+CMD ["bun", "dist/main.js"]
