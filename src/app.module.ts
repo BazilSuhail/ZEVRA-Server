@@ -22,6 +22,7 @@ import { ChatModule } from './chat/chat.module';
 import { CallsModule } from './modules/calls/calls.module';
 import { LivekitModule } from './modules/livekit/livekit.module';
 import { AppController } from './app.controller';
+import { HealthController } from './health.controller';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 
 @Module({
@@ -59,7 +60,7 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
     CallsModule,
     LivekitModule,
   ],
-  controllers: [AppController],
+  controllers: [AppController, HealthController],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
   ],

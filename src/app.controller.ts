@@ -12,7 +12,7 @@ export class AppController {
     private redisService: RedisService,
   ) {}
 
-  @Get('health')
+  @Get('health/detail')
   async getHealth() {
     const checks: Record<string, string> = {};
 
@@ -34,10 +34,20 @@ export class AppController {
 
     const allHealthy = Object.values(checks).every((v) => v === 'ok');
 
+    const mem = process.memoryUsage();
+
     return {
       success: allHealthy,
       status: allHealthy ? 'healthy' : 'degraded',
       checks,
+      memory: {
+        heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`,
+        heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB`,
+        rss: `${(mem.rss / 1024 / 1024).toFixed(1)} MB`,
+        external: `${(mem.external / 1024 / 1024).toFixed(1)} MB`,
+        arrayBuffers: `${(mem.arrayBuffers / 1024 / 1024).toFixed(1)} MB`,
+      },
+      uptime: `${(process.uptime()).toFixed(0)}s`,
       timestamp: new Date().toISOString(),
     };
   }
