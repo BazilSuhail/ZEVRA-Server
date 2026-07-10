@@ -80,7 +80,7 @@ export class RedisSessionService {
   async setOnline(userId: string): Promise<void> {
     if (!this.client) return;
     try {
-      await this.client.setEx(`presence:${userId}`, 30, 'online');
+      await this.client.setEx(`presence:${userId}`, 90, 'online');
     } catch {}
   }
 

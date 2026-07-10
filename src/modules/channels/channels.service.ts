@@ -152,9 +152,33 @@ export class ChannelsService {
     // Attach lastReadMessageId from membership data
     const membershipMap = new Map(memberChannels.map((mc) => [mc.channelId, mc.lastReadMessageId]));
 
+    // For DM channels, get the other member's ID
+    const dmChannelIds = result.filter((c) => c.type === 'DIRECT').map((c) => c.id);
+    const dmPeerMap = new Map<string, string>();
+
+    if (dmChannelIds.length > 0) {
+      const dmMembers = await this.db
+        .select({
+          channelId: memberships.channelId,
+          userId: memberships.userId,
+        })
+        .from(memberships)
+        .where(
+          and(
+            inArray(memberships.channelId, dmChannelIds),
+            sql`${memberships.userId} != ${userId}`,
+          ),
+        );
+
+      for (const m of dmMembers) {
+        dmPeerMap.set(m.channelId, m.userId);
+      }
+    }
+
     return result.map((channel) => ({
       ...channel,
       lastReadMessageId: membershipMap.get(channel.id) ?? null,
+      dmPeerId: channel.type === 'DIRECT' ? (dmPeerMap.get(channel.id) ?? null) : null,
     }));
   }
 

@@ -9,11 +9,11 @@ export class CallsHistoryController {
 
   @Get('history')
   async getHistory(
-    @Request() req: { user: { sub: string } },
+    @Request() req: { user: { id: string } },
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    const userId = req.user.sub;
+    const userId = req.user.id;
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(50, Math.max(1, Number(limit) || 20));
     const offset = (pageNum - 1) * limitNum;
@@ -30,11 +30,11 @@ export class CallsHistoryController {
 
   @Get('history/:userId')
   async getHistoryWithUser(
-    @Request() req: { user: { sub: string } },
+    @Request() req: { user: { id: string } },
     @Param('userId') otherUserId: string,
     @Query('limit') limit?: string,
   ) {
-    const userId = req.user.sub;
+    const userId = req.user.id;
     const limitNum = Math.min(50, Math.max(1, Number(limit) || 20));
 
     const calls = await this.callsService.getCallHistoryWithUser(

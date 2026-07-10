@@ -156,6 +156,17 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.startHeartbeat(client.id, user.id);
 
+    // Broadcast online status to all channel members
+    this.chatService.getUserChannelIds(user.id).then((channelIds) => {
+      for (const channelId of channelIds) {
+        this.server.to(`channel:${channelId}`).emit('user:joined', {
+          userId: user.id,
+          username: user.username,
+          channelId,
+        });
+      }
+    }).catch(() => {});
+
     client.emit('connected', {
       userId: user.id,
       username: user.username,
@@ -190,6 +201,20 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     const currentSocketId = await this.sessionService.getSession(user.id);
     if (currentSocketId === client.id) {
+      // Await channel lookup, then re-check if user reconnected before broadcasting
+      const channelIds = await this.chatService.getUserChannelIds(user.id);
+      const latestSocketId = await this.sessionService.getSession(user.id);
+      if (latestSocketId === client.id) {
+        // Session not replaced — user is truly going offline
+        for (const channelId of channelIds) {
+          this.server.to(`channel:${channelId}`).emit('user:left', {
+            userId: user.id,
+            username: user.username,
+            channelId,
+          });
+        }
+      }
+
       await this.sessionService.removeSession(user.id, client.id);
       await this.sessionService.setOffline(user.id);
       await this.pubSubService.unsubscribeFromUser(user.id);

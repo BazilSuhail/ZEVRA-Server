@@ -184,6 +184,8 @@ export class CallsGateway implements OnGatewayDisconnect {
     // Notify caller
     this.socketService.emitToUser(call.initiatorId, 'call:accepted', {
       callId: call.callId,
+      calleeId: user.id,
+      calleeUsername: user.username,
     });
 
     return { success: true };
@@ -238,8 +240,9 @@ export class CallsGateway implements OnGatewayDisconnect {
     const otherId = this.getOtherUserId(call, user.id);
     this.socketService.emitToUser(otherId, 'call:offer', {
       callId: call.callId,
-      sdp: data.sdp,
-      from: user.id,
+      offer: { type: 'offer', sdp: data.sdp },
+      callerId: user.id,
+      callerUsername: user.username,
     });
   }
 
@@ -259,8 +262,9 @@ export class CallsGateway implements OnGatewayDisconnect {
     const otherId = this.getOtherUserId(call, user.id);
     this.socketService.emitToUser(otherId, 'call:answer', {
       callId: call.callId,
-      sdp: data.sdp,
-      from: user.id,
+      answer: { type: 'answer', sdp: data.sdp },
+      calleeId: user.id,
+      calleeUsername: user.username,
     });
   }
 
@@ -385,6 +389,21 @@ export class CallsGateway implements OnGatewayDisconnect {
       null,
     );
 
+    // Look up target username
+    const [targetUser] = await this.db
+      .select({ id: users.id, username: users.username })
+      .from(users)
+      .where(eq(users.id, targetId));
+
+    // Notify caller with call method
+    this.socketService.emitToUser(user.id, 'call:method-selected', {
+      callId: call.callId,
+      method: 'WEBRTC',
+      targetUserId: targetId,
+      targetUsername: targetUser?.username ?? 'Unknown',
+    });
+
+    // Notify target
     this.socketService.emitToUser(targetId, 'call:incoming', {
       callId: call.callId,
       callerId: user.id,

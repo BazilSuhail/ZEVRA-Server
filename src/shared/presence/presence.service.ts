@@ -4,7 +4,7 @@ import { REDIS } from '../../redis/redis.module';
 @Injectable()
 export class PresenceService {
   private readonly PREFIX = 'presence:';
-  private readonly TTL_SECONDS = 300;
+  private readonly TTL_SECONDS = 90;
 
   constructor(@Inject(REDIS) private redis: any) {}
 
