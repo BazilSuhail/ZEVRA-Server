@@ -3,7 +3,7 @@ import { Inject } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { messages, memberships, pendingMessages, channels } from '../database/schema';
-import { eq, and, lt, desc, asc, sql } from 'drizzle-orm';
+import { eq, and, lt, desc, asc, sql, inArray } from 'drizzle-orm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { MessagesService } from '../modules/messages/messages.service';
@@ -292,6 +292,35 @@ export class ChatService {
       .from(memberships)
       .where(eq(memberships.userId, userId));
     return rows.map((r) => r.channelId);
+  }
+
+  async getUserDMPeers(userId: string): Promise<string[]> {
+    const dmChannels = await this.db
+      .select({ channelId: memberships.channelId })
+      .from(memberships)
+      .innerJoin(channels, eq(channels.id, memberships.channelId))
+      .where(
+        and(
+          eq(memberships.userId, userId),
+          eq(channels.type, 'DIRECT'),
+        ),
+      );
+
+    if (dmChannels.length === 0) return [];
+
+    const dmChannelIds = dmChannels.map((c) => c.channelId);
+
+    const dmPeers = await this.db
+      .select({ userId: memberships.userId })
+      .from(memberships)
+      .where(
+        and(
+          inArray(memberships.channelId, dmChannelIds),
+          sql`${memberships.userId} != ${userId}`,
+        ),
+      );
+
+    return [...new Set(dmPeers.map((p) => p.userId))];
   }
 
   async createOrJoinChannel(userId: string, participantIds: string[], type: string, name?: string) {

@@ -6,10 +6,10 @@ import { SrpService } from './srp.service';
 import { SrpStateService } from './srp-state.service';
 import { CryptoModule } from '../../shared/crypto/crypto.module';
 import { DatabaseModule } from '../../database/database.module';
-import { PresenceModule } from '../../shared/presence/presence.module';
+import { RedisModule } from '../../redis/redis.module';
 
 @Module({
-  imports: [CryptoModule, DatabaseModule, PresenceModule],
+  imports: [CryptoModule, DatabaseModule, RedisModule],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy, SrpService, SrpStateService],
   exports: [AuthService],

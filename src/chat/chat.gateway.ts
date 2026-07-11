@@ -73,6 +73,37 @@ export class ChatGateway implements OnGatewayInit {
         ...data,
       });
 
+      // Broadcast to channel room (same mechanism as typing — works via Redis adapter)
+      client.to(`channel:${msg.channelId}`).emit('message:new', {
+        messageId: msg.id,
+        channelId: msg.channelId,
+        senderId: msg.senderId,
+        encryptedContent: msg.encryptedContent,
+        contentIv: msg.contentIv,
+        contentTag: msg.contentTag,
+        sequenceNumber: msg.sequenceNumber,
+        senderKeyEpoch: msg.senderKeyEpoch,
+        messageType: msg.messageType,
+        createdAt: msg.createdAt.toISOString(),
+      });
+
+      // Cross-node via PubSub (for nodes not in the Socket.IO room)
+      await this.pubSubService.publishToGroup(msg.channelId, JSON.stringify({
+        event: 'message:new',
+        data: {
+          messageId: msg.id,
+          channelId: msg.channelId,
+          senderId: msg.senderId,
+          encryptedContent: msg.encryptedContent,
+          contentIv: msg.contentIv,
+          contentTag: msg.contentTag,
+          sequenceNumber: msg.sequenceNumber,
+          senderKeyEpoch: msg.senderKeyEpoch,
+          messageType: msg.messageType,
+          createdAt: msg.createdAt.toISOString(),
+        },
+      }));
+
       return { success: true, message: msg };
     } catch (err) {
       const error = err as any;

@@ -13,7 +13,7 @@ import { eq, and, lt, or } from 'drizzle-orm';
 import { CryptoService } from '../../shared/crypto/crypto.service';
 import { SrpService } from './srp.service';
 import { SrpStateService } from './srp-state.service';
-import { PresenceService } from '../../shared/presence/presence.service';
+import { RedisSessionService } from '../../redis/redis-session.service';
 import * as crypto from 'node:crypto';
 
 @Injectable()
@@ -26,7 +26,7 @@ export class AuthService {
     private jwt: JwtService,
     private srp: SrpService,
     private srpState: SrpStateService,
-    private presence: PresenceService,
+    private sessionService: RedisSessionService,
   ) {}
 
   // ─── Registration ─────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ export class AuthService {
       .where(eq(users.id, user.id));
 
     // Set presence in Redis
-    await this.presence.online(user.id);
+    await this.sessionService.setOnline(user.id);
 
     const keys = {
       publicKey: user.publicKey,
@@ -248,7 +248,7 @@ export class AuthService {
     await this.audit('LOGOUT', userId);
     await this.db.update(users).set({ status: 'OFFLINE' }).where(eq(users.id, userId));
     await this.db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
-    await this.presence.offline(userId);
+    await this.sessionService.setOffline(userId);
   }
 
   // ─── Audit ───────────────────────────────────────────────────────────────

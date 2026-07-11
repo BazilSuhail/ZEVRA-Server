@@ -8,8 +8,6 @@ import { memberships } from '../../database/schema';
 import { eq } from 'drizzle-orm';
 import { RedisSessionService } from '../../redis/redis-session.service';
 import { RedisCacheService } from '../../redis/redis-cache.service';
-import { RedisPubSubService } from '../../redis/redis-pubsub.service';
-import { SocketService } from '../../socket/socket.service';
 
 const BATCH_SIZE = 100;
 
@@ -39,8 +37,6 @@ export class MessageDeliveryProcessor extends WorkerHost {
     @Inject(DB) private db: NodePgDatabase,
     private sessionService: RedisSessionService,
     private cacheService: RedisCacheService,
-    private pubSubService: RedisPubSubService,
-    private socketService: SocketService,
   ) {
     super();
   }
@@ -91,8 +87,7 @@ export class MessageDeliveryProcessor extends WorkerHost {
     // 2. Check online status for all members
     const onlineUsers = await this.sessionService.getOnlineUsers(members);
 
-    // 3. Deliver in batches (skip sender)
-    let delivered = 0;
+    // 3. Handle offline users + unread counts (online delivery is handled by gateway room broadcast)
     let queued = 0;
 
     const recipients = members.filter((id) => id !== senderId);
@@ -102,10 +97,8 @@ export class MessageDeliveryProcessor extends WorkerHost {
 
       const results = await Promise.allSettled(
         batch.map(async (memberId) => {
-          if (onlineUsers.has(memberId)) {
-            const sent = await this.socketService.emitToUser(memberId, 'message:new', payload);
-            if (sent) delivered++;
-          } else {
+          if (!onlineUsers.has(memberId)) {
+            // Queue for delivery when user comes online
             await this.sessionService.addPendingMessage(memberId, payload);
             queued++;
           }
@@ -118,18 +111,10 @@ export class MessageDeliveryProcessor extends WorkerHost {
       );
     }
 
-    // 4. Publish to Redis PubSub (cross-node fan-out)
-    //    Note: No broadcastToChannel here — emitToUser already handles online users on this node.
-    //    Cross-node delivery is handled by PubSub → handlePubSubMessage → broadcastToChannel on remote nodes.
-    await this.pubSubService.publishToGroup(channelId, JSON.stringify({
-      event: 'message:new',
-      data: payload,
-    }));
-
     this.logger.debug(
-      `Delivery complete for ${messageId}: ${delivered} delivered, ${queued} queued, ${members.length} total members`,
+      `Delivery complete for ${messageId}: ${queued} queued (offline), ${members.length} total members`,
     );
 
-    return { delivered, queued, totalMembers: members.length };
+    return { queued, totalMembers: members.length };
   }
 }

@@ -13,7 +13,6 @@ import { MessagesModule } from './modules/messages/messages.module';
 import { ChannelsModule } from './modules/channels/channels.module';
 import { KeysModule } from './modules/keys/keys.module';
 import { QueuesModule } from './shared/queues/queues.module';
-import { PresenceModule } from './shared/presence/presence.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { ReactionsModule } from './modules/reactions/reactions.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
@@ -51,7 +50,6 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
     ChannelsModule,
     KeysModule,
     QueuesModule,
-    PresenceModule,
     AuditModule,
     ReactionsModule,
     UploadsModule,
