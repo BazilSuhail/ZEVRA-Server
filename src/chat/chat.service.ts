@@ -2,7 +2,7 @@ import { Injectable, Logger, ForbiddenException } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { messages, memberships, pendingMessages, channels } from '../database/schema';
+import { messages, memberships, messageReads, channels } from '../database/schema';
 import { eq, and, lt, desc, asc, sql, inArray } from 'drizzle-orm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -201,8 +201,8 @@ export class ChatService {
 
     // Insert read receipt (non-blocking, idempotent)
     await this.db
-      .insert(pendingMessages)
-      .values({ messageId, userId })
+      .insert(messageReads)
+      .values({ messageId, userId, readAt: new Date() })
       .onConflictDoNothing();
 
     // Reset unread count

@@ -19,14 +19,16 @@ describe('ChatGateway', () => {
       mockChatService,
       {},  // socketService
       {},  // reactionsService
-      {},  // pubSubService
+      { publishToGroup: jest.fn().mockResolvedValue(1) },  // pubSubService
       mockRateLimitService,
     );
 
+    const mockToEmit = jest.fn();
     mockClient = {
       id: 'socket-123',
       data: { user: { id: 'user-1', username: 'test' } },
       emit: jest.fn(),
+      to: jest.fn(() => ({ emit: mockToEmit })),
     };
   });
 
@@ -49,7 +51,18 @@ describe('ChatGateway', () => {
     });
 
     it('accepts messages at exactly 10KB', async () => {
-      mockChatService.sendMessage.mockResolvedValue({ id: 'msg-1' });
+      mockChatService.sendMessage.mockResolvedValue({
+        id: 'msg-1',
+        channelId: 'ch1',
+        senderId: 'user-1',
+        encryptedContent: 'x'.repeat(10240),
+        contentIv: 'iv',
+        contentTag: 'tag',
+        sequenceNumber: 1,
+        senderKeyEpoch: 1,
+        messageType: 'TEXT',
+        createdAt: new Date(),
+      });
       const result = await (gateway as any).handleSendMessage(mockClient, {
         ...baseMsg,
         encryptedContent: 'x'.repeat(10240),

@@ -169,9 +169,11 @@ describe('RedisCacheService', () => {
       mockClient = {
         setEx: jest.fn(async (key: string, _ttl: number, val: string) => { store.set(key, val); }),
         del: jest.fn(async (...args: any[]) => { for (const key of (Array.isArray(args[0]) ? args[0] : args)) store.delete(key); }),
-        keys: jest.fn(async (pattern: string) => {
-          const prefix = pattern.replace('*', '');
-          return Array.from(store.keys()).filter(k => k.startsWith(prefix));
+        scanIterator: jest.fn(function* () {
+          const prefix = 'typing:';
+          for (const key of store.keys()) {
+            if (key.startsWith(prefix)) yield key;
+          }
         }),
       };
       service.setClient(mockClient);

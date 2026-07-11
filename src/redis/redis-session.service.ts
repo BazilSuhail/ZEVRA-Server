@@ -46,6 +46,15 @@ export class RedisSessionService {
     }
   }
 
+  async getAndDeleteSession(userId: string): Promise<string | null> {
+    if (!this.client) return null;
+    try {
+      return await this.client.getDel(`session:${userId}`);
+    } catch {
+      return null;
+    }
+  }
+
   async getUserIdBySocket(socketId: string): Promise<string | null> {
     if (!this.client) return null;
     try {
@@ -164,11 +173,11 @@ export class RedisSessionService {
     }
   }
 
-  async getPendingMessages(userId: string): Promise<PendingMessage[]> {
+  async getPendingMessages(userId: string, limit = 100): Promise<PendingMessage[]> {
     if (!this.client) return [];
     try {
       const key = `pending:${userId}`;
-      const items = await this.client.zRangeWithScores(key, 0, -1);
+      const items = await this.client.zRangeWithScores(key, 0, limit - 1);
       return items.map((item) => JSON.parse(item.value));
     } catch {
       return [];

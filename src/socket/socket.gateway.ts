@@ -89,7 +89,6 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
       /* [SOCKET:REJECTED] */
       this.logger.warn(`[SOCKET:REJECTED] id=${client.id} reason=no_auth`);
       client.emit('error', { code: 'NOT_AUTHENTICATED', message: 'Authentication required' });
-      client.emit('error', { code: 'NOT_AUTHENTICATED', message: 'Authentication required' });
       client.disconnect(true);
       return;
     }
@@ -209,11 +208,10 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
       if (ipSockets.size === 0) this.ipConnections.delete(ip);
     }
 
-    const currentSocketId = await this.sessionService.getSession(user.id);
+    // Atomic: get + delete in one Redis call — prevents race with new connection
+    const currentSocketId = await this.sessionService.getAndDeleteSession(user.id);
     if (currentSocketId === client.id) {
-      // Session belongs to this socket — user is going offline
-      // Clean up session first (fast, pipeline)
-      await this.sessionService.removeSession(user.id, client.id);
+      // Session belonged to this socket — user is going offline
       await this.sessionService.setOffline(user.id);
 
       // Fire-and-forget: notify online DM peers

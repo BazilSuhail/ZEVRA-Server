@@ -144,7 +144,10 @@ export class RedisCacheService {
     if (!this.client) return [];
     try {
       const pattern = `typing:${channelId}:*`;
-      const keys = await this.client.keys(pattern);
+      const keys: string[] = [];
+      for await (const key of this.client.scanIterator({ MATCH: pattern, COUNT: 100 })) {
+        keys.push(String(key));
+      }
       return keys.map((key) => key.split(':').pop()!);
     } catch {
       return [];
