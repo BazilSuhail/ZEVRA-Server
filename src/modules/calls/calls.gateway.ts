@@ -339,7 +339,7 @@ export class CallsGateway implements OnGatewayDisconnect {
   @SubscribeMessage('call:initiate')
   async handleInitiate(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { targetUserIds: string[]; type: 'DM' | 'GROUP' },
+    @MessageBody() data: { targetUserIds: string[]; type: 'DM' | 'GROUP'; channelId?: string },
   ) {
     const user: SocketUser = client.data.user;
     if (!user) return { success: false, error: 'NOT_AUTHENTICATED' };
@@ -360,7 +360,18 @@ export class CallsGateway implements OnGatewayDisconnect {
 
     // GROUP → always LiveKit
     if (data.type === 'GROUP') {
-      return this.initiateLiveKitGroupCall(user, data.targetUserIds);
+      if (!data.channelId) {
+        return { success: false, error: 'CHANNEL_REQUIRED' };
+      }
+      // Only channel members may start a call in it
+      const authorized = await this.livekitService.authorizeRoomAccess(
+        LivekitService.getGroupRoomName(data.channelId),
+        user.id,
+      );
+      if (!authorized) {
+        return { success: false, error: 'NOT_MEMBER' };
+      }
+      return this.initiateLiveKitGroupCall(user, data.channelId, data.targetUserIds);
     }
 
     // DM → try WebRTC first
@@ -387,6 +398,7 @@ export class CallsGateway implements OnGatewayDisconnect {
       user.id,
       targetId,
       null,
+      data.channelId ?? null,
     );
 
     // Look up target username
@@ -418,7 +430,7 @@ export class CallsGateway implements OnGatewayDisconnect {
   @SubscribeMessage('call:livekit-fallback')
   async handleLiveKitFallback(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { targetUserIds: string[] },
+    @MessageBody() data: { targetUserIds: string[]; channelId?: string },
   ) {
     const user: SocketUser = client.data.user;
     if (!user) return { success: false, error: 'NOT_AUTHENTICATED' };
@@ -437,6 +449,14 @@ export class CallsGateway implements OnGatewayDisconnect {
 
     // Create LiveKit room (2 participants for DM)
     await this.livekitService.createRoom(roomName, 2);
+
+    const callLogId = await this.callsService.createCallLog(
+      'LIVEKIT',
+      user.id,
+      targetId,
+      roomName,
+      data.channelId ?? null,
+    );
 
     // Generate token for caller
     const token = await this.livekitService.generateToken(roomName, user.id, user.username);
@@ -462,6 +482,39 @@ export class CallsGateway implements OnGatewayDisconnect {
       roomName,
       serverUrl: process.env.LIVEKIT_URL,
       token,
+      callLogId,
+    };
+  }
+
+  // ─── call:livekit-active ───────────────────────────────────────────────
+  // Lets a client ask "is there an ongoing call in this group channel?"
+
+  @SubscribeMessage('call:livekit-active')
+  async handleLiveKitActive(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { channelId: string },
+  ) {
+    const user: SocketUser = client.data.user;
+    if (!user) return { success: false, error: 'NOT_AUTHENTICATED' };
+    if (!data.channelId) return { success: false, error: 'NO_CHANNEL' };
+
+    const authorized = await this.livekitService.authorizeRoomAccess(
+      LivekitService.getGroupRoomName(data.channelId),
+      user.id,
+    );
+    if (!authorized) return { success: false, error: 'NOT_MEMBER' };
+
+    if (!this.livekitService.isConfigured) {
+      return { success: true, active: false, participantCount: 0 };
+    }
+
+    const roomName = LivekitService.getGroupRoomName(data.channelId);
+    const participants = await this.livekitService.getParticipants(roomName);
+    return {
+      success: true,
+      active: participants.length > 0,
+      participantCount: participants.length,
+      roomName,
     };
   }
 
@@ -477,6 +530,19 @@ export class CallsGateway implements OnGatewayDisconnect {
 
     if (!this.livekitService.isConfigured) {
       return { success: false, error: 'LIVEKIT_NOT_CONFIGURED' };
+    }
+
+    if (!data.roomName) {
+      return { success: false, error: 'NO_ROOM' };
+    }
+
+    // Only channel members (group rooms) or the two DM participants may join
+    const authorized = await this.livekitService.authorizeRoomAccess(
+      data.roomName,
+      user.id,
+    );
+    if (!authorized) {
+      return { success: false, error: 'NOT_MEMBER' };
     }
 
     const token = await this.livekitService.generateToken(
@@ -501,16 +567,27 @@ export class CallsGateway implements OnGatewayDisconnect {
 
   private async initiateLiveKitGroupCall(
     user: SocketUser,
+    channelId: string,
     targetUserIds: string[],
   ) {
     if (!this.livekitService.isConfigured) {
       return { success: false, error: 'LIVEKIT_NOT_CONFIGURED' };
     }
 
-    const roomName = LivekitService.getGroupRoomName();
-    const maxParticipants = Math.min(10, targetUserIds.length + 1);
+    const roomName = LivekitService.getGroupRoomName(channelId);
+    const maxParticipants = 10;
 
     await this.livekitService.createRoom(roomName, maxParticipants);
+
+    // Create the call log up front (webhook room_started will reuse it);
+    // without this, group calls never appear in history when webhooks are off
+    const callLogId = await this.callsService.createCallLog(
+      'LIVEKIT',
+      user.id,
+      null,
+      roomName,
+      channelId,
+    );
 
     // Token for creator
     const creatorToken = await this.livekitService.generateToken(
@@ -519,8 +596,10 @@ export class CallsGateway implements OnGatewayDisconnect {
       user.username,
     );
 
-    // Notify all participants
+    // Notify all participants (online members are sent an invite; anyone can
+    // also join later via call:livekit-join-group while the room exists)
     for (const targetId of targetUserIds) {
+      if (targetId === user.id) continue;
       const targetToken = await this.livekitService.generateToken(roomName, targetId, '');
       if (targetToken) {
         this.socketService.emitToUser(targetId, 'livekit:group-invite', {
@@ -539,6 +618,7 @@ export class CallsGateway implements OnGatewayDisconnect {
       roomName,
       serverUrl: process.env.LIVEKIT_URL,
       token: creatorToken,
+      callLogId,
     };
   }
 }

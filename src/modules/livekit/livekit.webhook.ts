@@ -2,7 +2,7 @@ import { Injectable, Logger, Inject } from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { callLogs, callParticipants, users } from '../../database/schema';
-import { eq, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import { randomUUID } from 'crypto';
 
 @Injectable()
@@ -13,13 +13,23 @@ export class LivekitWebhookService {
 
   async handleRoomStarted(roomName: string): Promise<string | null> {
     try {
+      // Reuse the log created at call initiation (still open) — otherwise
+      // we'd end up with a duplicate row per room session
+      const [existing] = await this.db
+        .select({ id: callLogs.id })
+        .from(callLogs)
+        .where(and(eq(callLogs.roomName, roomName), isNull(callLogs.endedAt)))
+        .orderBy(desc(callLogs.startedAt))
+        .limit(1);
+      if (existing) return existing.id;
+
       const [row] = await this.db
         .insert(callLogs)
         .values({
           type: 'LIVEKIT',
           roomName,
-          status: 'completed',
-        } as any)
+          status: 'missed',
+        })
         .returning({ id: callLogs.id });
       return row.id;
     } catch (err) {
@@ -30,13 +40,31 @@ export class LivekitWebhookService {
 
   async handleRoomFinished(roomName: string, duration: number): Promise<void> {
     try {
-      await this.db
+      // Close the most recent open log for this room (rooms are recreated
+      // per session, so only the open one should be touched)
+      const updated = await this.db
         .update(callLogs)
         .set({
           endedAt: new Date(),
           duration,
+          status: 'completed',
         })
-        .where(eq(callLogs.roomName, roomName));
+        .where(and(eq(callLogs.roomName, roomName), isNull(callLogs.endedAt)))
+        .returning({ id: callLogs.id });
+
+      if (updated.length === 0) {
+        // No open log (e.g. initiation log was never created) — add one
+        await this.db
+          .insert(callLogs)
+          .values({
+            type: 'LIVEKIT',
+            roomName,
+            endedAt: new Date(),
+            duration,
+            status: 'completed',
+          })
+          .returning({ id: callLogs.id });
+      }
     } catch (err) {
       this.logger.error(`Failed to update call log on room_finished: ${(err as Error).message}`);
     }
@@ -49,18 +77,32 @@ export class LivekitWebhookService {
         .select({ id: callLogs.id })
         .from(callLogs)
         .where(eq(callLogs.roomName, roomName))
+        .orderBy(desc(callLogs.startedAt))
         .limit(1);
 
       if (!log) return;
 
-      await this.db
-        .insert(callParticipants)
-        .values({
-          callLogId: log.id,
-          userId: identity,
-          username: name,
-        })
-        .onConflictDoNothing();
+      // Rejoin after a leave: reset the row so duration counts from this join
+      const [reset] = await this.db
+        .update(callParticipants)
+        .set({ joinedAt: new Date(), leftAt: null, duration: null })
+        .where(
+          and(
+            eq(callParticipants.callLogId, log.id),
+            eq(callParticipants.userId, identity),
+          ),
+        )
+        .returning({ id: callParticipants.id });
+
+      if (!reset) {
+        await this.db
+          .insert(callParticipants)
+          .values({
+            callLogId: log.id,
+            userId: identity,
+            username: name,
+          });
+      }
     } catch (err) {
       this.logger.error(`Failed to add participant: ${(err as Error).message}`);
     }

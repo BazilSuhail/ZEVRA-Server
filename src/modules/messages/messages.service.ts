@@ -2,7 +2,7 @@ import { Inject, Injectable, ForbiddenException, NotFoundException, BadRequestEx
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { messages, memberships, channels, users } from '../../database/schema';
-import { eq, and, lt, desc, asc, sql } from 'drizzle-orm';
+import { eq, and, lt, gt, desc, asc, sql } from 'drizzle-orm';
 import { CryptoService } from '../../shared/crypto/crypto.service';
 
 @Injectable()
@@ -61,10 +61,13 @@ export class MessagesService {
       throw new ForbiddenException('Not a member of this channel');
     }
 
-    // 2. Verify Ed25519 signature (if provided)
+    // 2. Verify Ed25519 signature (if provided).
+    //    The signature binds the channel + ciphertext. It cannot bind the
+    //    sequence number because that is assigned server-side inside the
+    //    transaction below — the client never knows it in advance.
     if (params.signature && params.signature !== '' && member.publicKeySign) {
       const messageBytes = Buffer.from(
-        `${params.channelId}:${params.encryptedContent}:${params.sequenceNumber}`,
+        `${params.channelId}:${params.encryptedContent}`,
         'utf-8',
       );
       const signatureBytes = Buffer.from(params.signature, 'base64');
@@ -156,12 +159,22 @@ export class MessagesService {
     throw new BadRequestException('Failed to assign sequence number');
   }
 
-  async getMessages(channelId: string, userId: string, limit = 50, cursor?: string) {
-    // Build message query conditions
+  async getMessages(
+    channelId: string,
+    userId: string,
+    limit = 50,
+    cursor?: number,
+    mode: 'latest' | 'before' | 'since' = 'before',
+  ) {
+    // Build message query conditions (cursor = sequence_number)
     const conditions = [eq(messages.channelId, channelId)];
-    if (cursor) {
-      conditions.push(lt(messages.createdAt, new Date(cursor)));
+    if (mode === 'before' && cursor != null) {
+      conditions.push(lt(messages.sequenceNumber, cursor));
+    } else if (mode === 'since' && cursor != null) {
+      conditions.push(gt(messages.sequenceNumber, cursor));
     }
+
+    const descending = mode !== 'since';
 
     // Run membership check + message fetch in parallel
     const [membership, result] = await Promise.all([
@@ -191,7 +204,7 @@ export class MessagesService {
         })
         .from(messages)
         .where(and(...conditions))
-        .orderBy(asc(messages.createdAt))
+        .orderBy(descending ? desc(messages.sequenceNumber) : asc(messages.sequenceNumber))
         .limit(limit + 1),
     ]);
 
@@ -200,11 +213,19 @@ export class MessagesService {
     }
 
     const hasMore = result.length > limit;
-    const data = hasMore ? result.slice(0, limit) : result;
+    const page = hasMore ? result.slice(0, limit) : result;
+    const data = descending ? [...page].reverse() : page;
+
+    let nextCursor: number | null = null;
+    if (hasMore) {
+      nextCursor = descending
+        ? data[0]?.sequenceNumber ?? null
+        : data[data.length - 1]?.sequenceNumber ?? null;
+    }
 
     return {
       messages: data,
-      nextCursor: hasMore ? data[0].createdAt.toISOString() : null,
+      nextCursor,
       hasMore,
     };
   }

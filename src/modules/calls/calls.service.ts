@@ -119,12 +119,14 @@ export class CallsService {
     initiatorId: string,
     calleeId: string | null,
     roomName: string | null,
+    channelId?: string | null,
   ): Promise<string> {
     const data: typeof callLogs.$inferInsert = {
       type: callType,
       callerId: initiatorId,
       calleeId,
       roomName,
+      channelId: channelId ?? null,
       status: 'missed',
     };
     const [row] = await this.db

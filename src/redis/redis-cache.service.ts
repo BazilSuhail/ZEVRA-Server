@@ -28,7 +28,8 @@ export class RedisCacheService {
     if (!this.client) return [];
     try {
       const key = `cache:messages:${channelId}`;
-      const items = await this.client.lRange(key, 0, limit - 1);
+      // Return the LAST `limit` items (newest page), ascending
+      const items = await this.client.lRange(key, -limit, -1);
       return items.map((item) => JSON.parse(item));
     } catch {
       return [];

@@ -15,6 +15,13 @@
       "when": 1787843346324,
       "tag": "0001_drop_participant_ids_add_pending_messages",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790851200000,
+      "tag": "0002_add_call_logs_call_participants",
+      "breakpoints": true
     }
   ]
 }

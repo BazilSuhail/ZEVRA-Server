@@ -1,4 +1,17 @@
-import { Controller, Post, Body, Headers, HttpCode, Logger } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Body,
+  Headers,
+  HttpCode,
+  Logger,
+  UseGuards,
+  Request,
+  ForbiddenException,
+  UnauthorizedException,
+  BadRequestException,
+} from '@nestjs/common';
+import { JwtAuthGuard } from '../../shared/guards/jwt-auth.guard';
 import { LivekitService } from './livekit.service';
 import { LivekitWebhookService } from './livekit.webhook';
 
@@ -14,28 +27,37 @@ export class LivekitController {
   // ─── Token Endpoint ──────────────────────────────────────────────────
 
   @Post('token')
+  @UseGuards(JwtAuthGuard)
   async getToken(
-    @Body() body: { roomName: string; participantIdentity: string; participantName: string },
+    @Request() req: { user: { id: string; username: string } },
+    @Body() body: { roomName: string; participantName?: string },
   ) {
-    const { roomName, participantIdentity, participantName } = body;
+    const { roomName, participantName } = body;
 
-    if (!roomName || !participantIdentity || !participantName) {
-      return { error: 'roomName, participantIdentity, and participantName are required' };
+    if (!roomName) {
+      throw new BadRequestException('roomName is required');
     }
 
-    const token = await this.livekitService.generateToken(
-      roomName,
-      participantIdentity,
-      participantName,
-    );
+    // Never trust a client-supplied identity — always use the authenticated user
+    const userId = req.user.id;
+    const username = participantName || req.user.username;
+
+    // Only allow joining rooms the authenticated user belongs to
+    const authorized = await this.livekitService.authorizeRoomAccess(roomName, userId);
+    if (!authorized) {
+      throw new ForbiddenException('Not allowed to join this room');
+    }
+
+    const token = await this.livekitService.generateToken(roomName, userId, username);
 
     if (!token) {
-      return { error: 'LiveKit not configured' };
+      throw new UnauthorizedException('LiveKit not configured');
     }
 
     return {
       serverUrl: process.env.LIVEKIT_URL,
       token,
+      roomName,
     };
   }
 

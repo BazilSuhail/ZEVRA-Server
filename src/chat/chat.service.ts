@@ -2,8 +2,8 @@ import { Injectable, Logger, ForbiddenException } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { DB } from '../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { messages, memberships, messageReads, channels } from '../database/schema';
-import { eq, and, lt, desc, asc, sql, inArray } from 'drizzle-orm';
+import { messages, memberships, messageReads, channels, reactions, users } from '../database/schema';
+import { eq, and, lt, gt, desc, asc, sql, inArray } from 'drizzle-orm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { MessagesService } from '../modules/messages/messages.service';
@@ -37,6 +37,7 @@ export interface PendingMessagePayload {
   sequenceNumber: number;
   senderKeyEpoch: number;
   messageType: string;
+  metadata?: Record<string, unknown> | null;
   createdAt: string;
 }
 
@@ -72,6 +73,7 @@ export class ChatService {
       sequenceNumber: msg.sequenceNumber,
       senderKeyEpoch: msg.senderKeyEpoch,
       messageType: msg.messageType,
+      metadata: (msg.metadata as Record<string, unknown>) ?? null,
       createdAt: msg.createdAt.toISOString(),
     };
 
@@ -89,6 +91,7 @@ export class ChatService {
       sequenceNumber: msg.sequenceNumber,
       senderKeyEpoch: msg.senderKeyEpoch,
       messageType: msg.messageType,
+      metadata: (msg.metadata as Record<string, unknown>) ?? null,
       createdAt: msg.createdAt.toISOString(),
     }, {
       priority: 1, // High priority for message delivery
@@ -100,8 +103,56 @@ export class ChatService {
   }
 
   // ─── Get Messages (cache-first) ────────────────────────────────────────
+  //
+  // Contract: cursor = sequence_number (per-channel, monotonic).
+  //   mode 'latest' (default, no cursor): newest `limit`, returned ascending
+  //   mode 'before' (cursor): older than cursor, newest `limit`, ascending
+  //   mode 'since'  (cursor): newer than cursor, oldest `limit`, ascending
+  // nextCursor = sequence_number of the oldest message in the page (for
+  // 'before' paging) or the newest (for 'since' paging); null when no more.
 
-  async getMessages(channelId: string, userId: string, limit = 50, cursor?: string) {
+  /**
+   * Batch-load reactions for a page of messages (one query, usernames
+   * included) so history responses are reaction-complete.
+   */
+  private async getReactionsForMessages(messageIds: string[]) {
+    if (messageIds.length === 0) return {} as Record<
+      string,
+      { emoji: string; userId: string; username: string | null }[]
+    >;
+
+    const rows = await this.db
+      .select({
+        messageId: reactions.messageId,
+        emoji: reactions.emoji,
+        userId: reactions.userId,
+        username: users.username,
+      })
+      .from(reactions)
+      .leftJoin(users, eq(users.id, reactions.userId))
+      .where(inArray(reactions.messageId, messageIds));
+
+    const grouped: Record<
+      string,
+      { emoji: string; userId: string; username: string | null }[]
+    > = {};
+    for (const row of rows) {
+      (grouped[row.messageId] ||= []).push({
+        emoji: row.emoji,
+        userId: row.userId,
+        username: row.username,
+      });
+    }
+    return grouped;
+  }
+
+  async getMessages(
+    channelId: string,
+    userId: string,
+    limit = 50,
+    cursor?: number,
+    mode: 'latest' | 'before' | 'since' = 'before',
+  ) {
     // Verify membership
     const [membership] = await this.db
       .select({ id: memberships.id })
@@ -117,19 +168,39 @@ export class ChatService {
       throw new ForbiddenException('Not a member of this channel');
     }
 
-    // Try cache first (only for most recent messages without cursor)
-    if (!cursor) {
+    // Try cache first — only for the latest page
+    if (mode === 'latest' && cursor == null) {
       const cached = await this.cacheService.getRecentMessages(channelId, limit);
       if (cached.length >= limit) {
-        return { messages: cached, nextCursor: null, hasMore: false, source: 'cache' };
+        // Cache payloads are keyed `messageId`; the response contract is `id`
+        const items = (cached as PendingMessagePayload[]).map((m) => ({
+          ...m,
+          id: m.messageId,
+        }));
+        const reactionMap = await this.getReactionsForMessages(
+          items.map((m) => m.id),
+        );
+        return {
+          messages: items.map((m) => ({
+            ...m,
+            reactions: reactionMap[m.id] ?? [],
+          })),
+          nextCursor: items[0]?.sequenceNumber ?? null,
+          hasMore: true,
+          source: 'cache',
+        };
       }
     }
 
     // Fallback to Postgres
     const conditions = [eq(messages.channelId, channelId)];
-    if (cursor) {
-      conditions.push(lt(messages.createdAt, new Date(cursor)));
+    if (mode === 'before' && cursor != null) {
+      conditions.push(lt(messages.sequenceNumber, cursor));
+    } else if (mode === 'since' && cursor != null) {
+      conditions.push(gt(messages.sequenceNumber, cursor));
     }
+
+    const descending = mode !== 'since';
 
     const result = await this.db
       .select({
@@ -148,15 +219,32 @@ export class ChatService {
       })
       .from(messages)
       .where(and(...conditions))
-      .orderBy(asc(messages.createdAt))
+      .orderBy(descending ? desc(messages.sequenceNumber) : asc(messages.sequenceNumber))
       .limit(limit + 1);
 
     const hasMore = result.length > limit;
-    const data = hasMore ? result.slice(0, limit) : result;
+    const page = hasMore ? result.slice(0, limit) : result;
+    const data = descending ? [...page].reverse() : page;
+
+    // Attach reactions for the whole page in one query
+    const reactionMap = await this.getReactionsForMessages(
+      data.map((m) => m.id),
+    );
+    const withReactions = data.map((m) => ({
+      ...m,
+      reactions: reactionMap[m.id] ?? [],
+    }));
+
+    let nextCursor: number | null = null;
+    if (hasMore) {
+      nextCursor = descending
+        ? data[0]?.sequenceNumber ?? null // oldest → fetch 'before' from here
+        : data[data.length - 1]?.sequenceNumber ?? null; // newest → fetch 'since'
+    }
 
     return {
-      messages: data,
-      nextCursor: hasMore ? data[0].createdAt.toISOString() : null,
+      messages: withReactions,
+      nextCursor,
       hasMore,
       source: 'database',
     };
@@ -219,7 +307,7 @@ export class ChatService {
     return { success: true, advanced: true };
   }
 
-  // ─── Get Unread Counts ────────────────────────────────────────────────
+  // ─── Get Unread Counts ─────────────────────────────────────────────────
 
   async getUnreadCounts(userId: string) {
     const memberChannels = await this.db
@@ -266,7 +354,7 @@ export class ChatService {
     await this.sessionService.addChannelMember(channelId, userId);
   }
 
-  // ─── Handle Incoming PubSub Message (cross-node) ──────────────────────
+  // ─── Handle Incoming PubSub Message (cross-node) ───────────────────────
 
   async handlePubSubMessage(channelId: string, message: string) {
     try {

@@ -20,16 +20,22 @@ export class MessagesController {
     @Param('channelId') channelId: string,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
+    @Query('mode') mode?: string,
   ) {
     let parsedLimit = limit ? parseInt(limit, 10) : 50;
     if (isNaN(parsedLimit) || parsedLimit < 1) parsedLimit = 1;
     if (parsedLimit > 100) parsedLimit = 100;
 
+    const parsedCursor = cursor != null && cursor !== '' ? parseInt(cursor, 10) : undefined;
+    const parsedMode =
+      mode === 'latest' || mode === 'before' || mode === 'since' ? mode : undefined;
+
     return this.messagesService.getMessages(
       channelId,
       userId,
       parsedLimit,
-      cursor,
+      parsedCursor !== undefined && !isNaN(parsedCursor) ? parsedCursor : undefined,
+      parsedMode,
     );
   }
 

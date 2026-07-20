@@ -84,6 +84,7 @@ export class ChatGateway implements OnGatewayInit {
         sequenceNumber: msg.sequenceNumber,
         senderKeyEpoch: msg.senderKeyEpoch,
         messageType: msg.messageType,
+        metadata: msg.metadata,
         createdAt: msg.createdAt.toISOString(),
       });
 
@@ -100,6 +101,7 @@ export class ChatGateway implements OnGatewayInit {
           sequenceNumber: msg.sequenceNumber,
           senderKeyEpoch: msg.senderKeyEpoch,
           messageType: msg.messageType,
+          metadata: msg.metadata,
           createdAt: msg.createdAt.toISOString(),
         },
       }));
@@ -118,7 +120,13 @@ export class ChatGateway implements OnGatewayInit {
   @SubscribeMessage('get-messages')
   async handleGetMessages(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string; limit?: number; cursor?: string },
+    @MessageBody()
+    data: {
+      channelId: string;
+      limit?: number;
+      cursor?: number;
+      mode?: 'latest' | 'before' | 'since';
+    },
   ) {
     const user: SocketUser = client.data.user;
 
@@ -137,6 +145,7 @@ export class ChatGateway implements OnGatewayInit {
         user.id,
         data.limit ?? 50,
         data.cursor,
+        data.mode,
       );
       return { success: true, ...result };
     } catch (err) {
@@ -199,6 +208,23 @@ export class ChatGateway implements OnGatewayInit {
         data.messageId,
         data.emoji,
       );
+
+      // One reaction per user: announce displaced emojis FIRST so receivers
+      // swap instead of accumulating
+      for (const replacedEmoji of result.replaced ?? []) {
+        const removedReaction = {
+          userId: user.id,
+          username: user.username,
+          messageId: data.messageId,
+          emoji: replacedEmoji,
+          channelId: data.channelId,
+        };
+        client.to(`channel:${data.channelId}`).emit('reaction:removed', removedReaction);
+        await this.pubSubService.publishToGroup(data.channelId, JSON.stringify({
+          event: 'reaction:removed',
+          data: removedReaction,
+        }));
+      }
 
       if (result.action === 'added') {
         // Broadcast to channel room

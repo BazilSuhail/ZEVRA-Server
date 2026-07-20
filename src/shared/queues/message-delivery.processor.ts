@@ -21,6 +21,7 @@ export interface MessageDeliveryJob {
   sequenceNumber: number;
   senderKeyEpoch: number;
   messageType: string;
+  metadata?: Record<string, unknown> | null;
   createdAt: string;
 }
 
@@ -52,6 +53,7 @@ export class MessageDeliveryProcessor extends WorkerHost {
       sequenceNumber,
       senderKeyEpoch,
       messageType,
+      metadata,
       createdAt,
     } = job.data;
 
@@ -65,6 +67,7 @@ export class MessageDeliveryProcessor extends WorkerHost {
       sequenceNumber,
       senderKeyEpoch,
       messageType,
+      metadata: metadata ?? null,
       createdAt,
     };
 

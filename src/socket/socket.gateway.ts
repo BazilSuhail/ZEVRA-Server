@@ -232,6 +232,26 @@ export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
+  // ─── Presence ─────────────────────────────────────────────────────────
+
+  @SubscribeMessage('presence:bulk')
+  async handlePresenceBulk(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { userIds?: string[] } | undefined,
+  ) {
+    const user: SocketUser = client.data.user;
+    if (!user) return { online: [] };
+
+    let userIds = Array.isArray(data?.userIds) ? data!.userIds!.filter(Boolean) : [];
+    if (userIds.length === 0) {
+      userIds = await this.chatService.getUserDMPeers(user.id);
+    }
+    if (userIds.length === 0) return { online: [] };
+
+    const online = await this.sessionService.getOnlineUsers(userIds);
+    return { online: Array.from(online) };
+  }
+
   // ─── Create or Join Channel ──────────────────────────────────────────
 
   @UseGuards(SocketAuthGuard)

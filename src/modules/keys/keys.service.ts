@@ -1,8 +1,8 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, ForbiddenException } from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { users, senderKeys } from '../../database/schema';
-import { eq, and, inArray } from 'drizzle-orm';
+import { users, senderKeys, memberships } from '../../database/schema';
+import { eq, and, inArray, isNull } from 'drizzle-orm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 
@@ -82,6 +82,23 @@ export class KeysService {
     encryptedKey: string;
     keySignature: string;
   }[]) {
+    // Only members of the group may upload sender keys to it
+    const [membership] = await this.db
+      .select({ id: memberships.id })
+      .from(memberships)
+      .where(
+        and(
+          eq(memberships.userId, ownerId),
+          eq(memberships.channelId, groupId),
+          isNull(memberships.leftAt),
+        ),
+      )
+      .limit(1);
+
+    if (!membership) {
+      throw new ForbiddenException('Not a member of this group');
+    }
+
     const values = items.map((item) => ({
       ownerId,
       groupId,
@@ -91,7 +108,8 @@ export class KeysService {
       keySignature: item.keySignature,
     }));
 
-    // Batch insert (upsert: delete old epoch for this group, then insert)
+    // Batch insert (upsert: delete ONLY this owner's keys for this epoch,
+    // never other members' keys, then insert)
     if (values.length > 0) {
       await this.db
         .delete(senderKeys)
@@ -99,6 +117,7 @@ export class KeysService {
           and(
             eq(senderKeys.groupId, groupId),
             eq(senderKeys.epoch, epoch),
+            eq(senderKeys.ownerId, ownerId),
           ),
         );
 

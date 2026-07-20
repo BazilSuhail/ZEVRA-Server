@@ -140,6 +140,7 @@ export class ChannelsService {
         lastMessageSenderName: users.username,
         lastMessageIv: messages.contentIv,
         lastMessageTag: messages.contentTag,
+        lastMessageMetadata: messages.metadata,
         lastMessageSenderKeyEpoch: messages.senderKeyEpoch,
         createdAt: channels.createdAt,
       })

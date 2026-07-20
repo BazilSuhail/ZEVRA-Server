@@ -1,9 +1,17 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { AccessToken, RoomServiceClient, WebhookReceiver } from 'livekit-server-sdk';
+import { DB } from '../../database/database.module';
+import { NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { memberships } from '../../database/schema';
+import { and, eq, isNull } from 'drizzle-orm';
 
 const API_KEY = process.env.LIVEKIT_API_KEY!;
 const API_SECRET = process.env.LIVEKIT_API_SECRET!;
 const LIVEKIT_URL = process.env.LIVEKIT_URL!;
+
+const UUID_RE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const DM_ROOM_RE = new RegExp(`^dm-(${UUID_RE})-(${UUID_RE})$`, 'i');
+const GROUP_ROOM_RE = new RegExp(`^group-(${UUID_RE})$`, 'i');
 
 @Injectable()
 export class LivekitService {
@@ -11,7 +19,7 @@ export class LivekitService {
   private roomClient: RoomServiceClient | null = null;
   private webhookReceiver: WebhookReceiver | null = null;
 
-  constructor() {
+  constructor(@Inject(DB) private db: NodePgDatabase) {
     if (API_KEY && API_SECRET && LIVEKIT_URL) {
       this.roomClient = new RoomServiceClient(LIVEKIT_URL, API_KEY, API_SECRET);
       this.webhookReceiver = new WebhookReceiver(API_KEY, API_SECRET);
@@ -109,7 +117,46 @@ export class LivekitService {
     return `dm-${sorted[0]}-${sorted[1]}`;
   }
 
-  static getGroupRoomName(): string {
-    return `group-${crypto.randomUUID()}`;
+  static getGroupRoomName(channelId: string): string {
+    return `group-${channelId}`;
+  }
+
+  // ─── Authorization ──────────────────────────────────────────────────
+
+  /**
+   * Verify a user may join a LiveKit room.
+   * - dm-{a}-{b}: only user a or user b.
+   * - group-{channelId}: only active members of that channel.
+   * Unknown room formats are denied.
+   */
+  async authorizeRoomAccess(roomName: string, userId: string): Promise<boolean> {
+    const dm = DM_ROOM_RE.exec(roomName);
+    if (dm) {
+      return dm[1].toLowerCase() === userId.toLowerCase() || dm[2].toLowerCase() === userId.toLowerCase();
+    }
+
+    const group = GROUP_ROOM_RE.exec(roomName);
+    if (group) {
+      const channelId = group[1];
+      try {
+        const [row] = await this.db
+          .select({ id: memberships.id })
+          .from(memberships)
+          .where(
+            and(
+              eq(memberships.userId, userId),
+              eq(memberships.channelId, channelId),
+              isNull(memberships.leftAt),
+            ),
+          )
+          .limit(1);
+        return !!row;
+      } catch (err) {
+        this.logger.error(`Room auth check failed: ${(err as Error).message}`);
+        return false;
+      }
+    }
+
+    return false;
   }
 }

@@ -11,6 +11,7 @@ export interface PendingMessage {
   sequenceNumber: number;
   senderKeyEpoch: number;
   messageType: string;
+  metadata?: Record<string, unknown> | null;
   createdAt: string;
 }
 
