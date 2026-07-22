@@ -190,6 +190,7 @@ export class MessagesService {
       this.db
         .select({
           id: messages.id,
+          channelId: messages.channelId,
           messageType: messages.messageType,
           encryptedContent: messages.encryptedContent,
           contentIv: messages.contentIv,
