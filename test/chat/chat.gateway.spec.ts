@@ -100,7 +100,13 @@ describe('ChatGateway', () => {
       mockChatService.getMessages.mockResolvedValue({ messages: [], hasMore: false });
       const result = await (gateway as any).handleGetMessages(mockClient, { channelId: 'ch1', limit: 25 });
       expect(result.success).toBe(true);
-      expect(mockChatService.getMessages).toHaveBeenCalledWith('ch1', 'user-1', 25, undefined);
+      expect(mockChatService.getMessages).toHaveBeenCalledWith(
+        'ch1',
+        'user-1',
+        25,
+        undefined,
+        undefined,
+      );
     });
   });
 
