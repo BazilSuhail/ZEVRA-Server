@@ -4,443 +4,420 @@ import {
   SubscribeMessage,
   OnGatewayConnection,
   OnGatewayDisconnect,
+  OnGatewayInit,
   ConnectedSocket,
   MessageBody,
 } from '@nestjs/websockets';
-import { Logger, UseGuards, Inject } from '@nestjs/common';
+import { Logger, UseGuards, Inject, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
-import { SocketAuthGuard, SocketUser } from './socket-auth.guard';
-import { SocketService } from './socket.service';
+import { NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { and, eq } from 'drizzle-orm';
+import { IsArray, IsOptional, IsUUID, ArrayMaxSize } from 'class-validator';
+import {
+  SocketAuthGuard,
+  SocketData,
+  SocketUser,
+  SOCKET_JWT_VERIFY_OPTIONS,
+  extractSocketToken,
+  isTokenExpired,
+} from './socket-auth.guard';
+import { SocketService, channelRoom, userRoom } from './socket.service';
+import { validatePayload } from './validate-payload';
+import { createSocketRedisAdapter } from './socket-redis-adapter';
 import { RedisSessionService } from '../redis/redis-session.service';
 import { RedisCacheService } from '../redis/redis-cache.service';
-import { RedisPubSubService } from '../redis/redis-pubsub.service';
 import { RedisService } from '../redis/redis.service';
+import { ChannelMembersService } from '../redis/channel-members.service';
 import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
 import { ChatService } from '../chat/chat.service';
-import { createSocketRedisAdapter } from './socket-redis-adapter';
+import { ChannelsService } from '../modules/channels/channels.service';
+import { CreateChannelDto } from '../modules/channels/dto/create-channel.dto';
+import { ChannelIdDto } from '../modules/channels/dto/mark-read.dto';
 import { DB } from '../database/database.module';
-import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { users } from '../database/schema';
-import { eq } from 'drizzle-orm';
+import { SocketError, toSocketError } from '../common/errors/socket-error';
+import { getCorsOrigins } from '../common/config';
 
-@WebSocketGateway({ cors: true })
-export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const TYPING_AUTO_STOP_MS = 6_000;
+
+class PresenceBulkDto {
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(500)
+  @IsUUID('all', { each: true })
+  userIds?: string[];
+}
+
+@WebSocketGateway({ cors: { origin: getCorsOrigins(), credentials: true } })
+export class SocketGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
+{
   private readonly logger = new Logger(SocketGateway.name);
 
   @WebSocketServer()
   server!: Server;
 
   private heartbeatIntervals = new Map<string, ReturnType<typeof setInterval>>();
-  private ipConnections = new Map<string, Set<string>>();
+  /** key `${socketId}|${channelId}` → auto typing:stop timer */
   private typingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(
     private socketService: SocketService,
     private sessionService: RedisSessionService,
     private cacheService: RedisCacheService,
-    private pubSubService: RedisPubSubService,
+    private channelMembers: ChannelMembersService,
     private rateLimitService: RateLimitService,
     private redisService: RedisService,
     private chatService: ChatService,
+    private channelsService: ChannelsService,
     private jwt: JwtService,
     @Inject(DB) private db: NodePgDatabase,
   ) {}
 
   afterInit() {
     this.socketService.setServer(this.server);
+    this.attachRedisAdapter().catch((err) =>
+      this.logger.error(`Redis adapter setup failed: ${(err as Error).message}`),
+    );
+  }
 
-    // Attach Redis adapter for multi-node broadcast
+  private async attachRedisAdapter() {
     const pubClient = this.redisService.getClient();
-    if (pubClient) {
-      const subClient = pubClient.duplicate();
-      this.server.adapter(createSocketRedisAdapter(pubClient, subClient));
-      this.logger.log('Socket.io Redis adapter attached — multi-node enabled');
-    } else {
-      this.logger.warn('Redis unavailable — single-node Socket.io mode');
+    const subClient = pubClient ? await this.redisService.createDedicatedClient('socket-adapter-sub') : null;
+    if (!pubClient || !subClient) {
+      this.logger.warn('Redis unavailable — Socket.IO running in single-node mode');
+      return;
     }
+    this.server.adapter(createSocketRedisAdapter(pubClient, subClient));
+    this.logger.log('Socket.IO Redis adapter attached');
+  }
 
-    this.logger.log('Socket.io gateway initialized');
+  onModuleDestroy() {
+    for (const interval of this.heartbeatIntervals.values()) clearInterval(interval);
+    for (const timeout of this.typingTimeouts.values()) clearTimeout(timeout);
+    this.heartbeatIntervals.clear();
+    this.typingTimeouts.clear();
+  }
+
+  private clientIp(client: Socket): string {
+    if (process.env.TRUST_PROXY === 'true') {
+      const header = client.handshake.headers['x-forwarded-for'];
+      const raw = Array.isArray(header) ? header[0] : header;
+      const first = raw?.split(',')[0]?.trim();
+      if (first) return first;
+    }
+    return client.handshake.address;
+  }
+
+  private rejectConnection(client: Socket, code: string, message: string) {
+    client.emit('error', { code, message });
+    client.disconnect(true);
   }
 
   // ─── Connection ────────────────────────────────────────────────────────
 
-  // @UseGuards(SocketAuthGuard) — doesn't reliably block handleConnection in WS gateways
   async handleConnection(@ConnectedSocket() client: Socket) {
-    // Inline auth check
-    let user: SocketUser | undefined;
-
-    const token =
-      client.handshake?.auth?.token ||
-      client.handshake?.headers?.authorization?.slice(7);
-
-    if (token) {
-      try {
-        const payload = await this.jwt.verifyAsync<{ sub: string }>(token);
-        const [found] = await this.db
-          .select({ id: users.id, username: users.username, email: users.email, status: users.status })
-          .from(users)
-          .where(eq(users.id, payload.sub));
-        user = found;
-      } catch {}
+    const ip = this.clientIp(client);
+    const ipResult = await this.rateLimitService.checkRateLimit(
+      `conn-ip:${ip}`,
+      RateLimitService.CONNECTION_PER_IP,
+    );
+    if (!ipResult.allowed) {
+      this.logger.warn(`Connection rejected: rate limit for ${ip}`);
+      return this.rejectConnection(client, 'RATE_LIMITED', 'Too many connections');
     }
 
+    let user: SocketUser | undefined;
+    let tokenExp: number | undefined;
+    const token = extractSocketToken(client);
+    if (token) {
+      try {
+        const payload = await this.jwt.verifyAsync<{ sub: string; exp?: number }>(
+          token,
+          SOCKET_JWT_VERIFY_OPTIONS,
+        );
+        const [found] = await this.db
+          .select({ id: users.id, username: users.username, status: users.status })
+          .from(users)
+          .where(and(eq(users.id, payload.sub), eq(users.isActive, true)));
+        user = found;
+        tokenExp = payload.exp;
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'TokenExpiredError') {
+          return this.rejectConnection(client, 'TOKEN_EXPIRED', 'Token expired');
+        }
+      }
+    }
     if (!user) {
-      /* [SOCKET:REJECTED] */
-      this.logger.warn(`[SOCKET:REJECTED] id=${client.id} reason=no_auth`);
-      client.emit('error', { code: 'NOT_AUTHENTICATED', message: 'Authentication required' });
-      client.disconnect(true);
-      return;
+      return this.rejectConnection(client, 'NOT_AUTHENTICATED', 'Authentication required');
     }
 
     client.data.user = user;
+    client.data.tokenExp = tokenExp;
 
-    const ip = (client.handshake.headers['x-forwarded-for'] as string) || client.handshake.address;
+    let socketCount: number | null;
+    try {
+      // Join personal + channel rooms before announcing readiness, so nothing
+      // emitted after `connected` can be missed.
+      const channelIds = await this.chatService.getUserChannelIds(user.id);
+      await client.join([userRoom(user.id), ...channelIds.map(channelRoom)]);
+      if (!client.connected) return;
 
-    /* [SOCKET:CONNECT] */
-    this.logger.log(`[SOCKET:CONNECT] id=${client.id} user=${user.id} username=${user.username} ip=${ip}`);
-
-    // IP connection rate limit
-    const ipKey = `ip:${ip}`;
-    const ipResult = await this.rateLimitService.checkRateLimit(ipKey, RateLimitService.CONNECTION_PER_IP);
-    if (!ipResult.allowed) {
-      this.logger.warn(`Connection rejected — IP ${ip} exceeded rate limit`);
-      client.emit('error', { code: 'RATE_LIMITED', message: 'Too many connections' });
-      client.disconnect(true);
+      socketCount = await this.sessionService.addSocket(user.id, client.id);
+      await this.sessionService.setOnline(user.id);
+    } catch (err) {
+      this.logger.error(`Connection setup failed for ${user.id}: ${(err as Error).message}`);
+      return this.rejectConnection(client, 'INTERNAL_ERROR', 'Connection setup failed');
+    }
+    if (!client.connected) {
+      await this.sessionService.removeSocket(user.id, client.id);
       return;
     }
+    this.startHeartbeat(client);
 
-    // Track IP connections
-    if (!this.ipConnections.has(ip)) {
-      this.ipConnections.set(ip, new Set());
-    }
-    this.ipConnections.get(ip)!.add(client.id);
+    client.emit('connected', { userId: user.id, username: user.username, socketId: client.id });
 
-    this.logger.log(`Client connected: ${client.id} (user: ${user.username})`);
-
-    // Single-session enforcement
-    const existingSocketId = await this.sessionService.getSession(user.id);
-    if (existingSocketId && existingSocketId !== client.id) {
-      const existingSocket = this.server.sockets.sockets.get(existingSocketId);
-      if (existingSocket) {
-        existingSocket.emit('forced-disconnect', {
-          reason: 'Another device connected',
-        });
-        existingSocket.disconnect(true);
-      }
-      this.logger.log(`Disconnected old session for user ${user.username}`);
-    }
-
-    await this.sessionService.registerSession(user.id, client.id);
-    await this.sessionService.setOnline(user.id);
-
-    // Auto-join all channel rooms (needed for typing, reactions, read receipts)
-    this.chatService.getUserChannelIds(user.id).then((channelIds) => {
-      for (const channelId of channelIds) {
-        client.join(`channel:${channelId}`);
-      }
-      this.logger.debug(`Auto-joined ${channelIds.length} channels for ${user.username}`);
-    }).catch((err) =>
-      this.logger.warn(`Auto-join channels failed: ${(err as Error).message}`),
-    );
-
-    // Auto-deliver pending messages from previous session
-    this.chatService.deliverPendingMessages(user.id).catch((err) =>
-      this.logger.warn(`Auto-deliver pending failed: ${(err as Error).message}`),
-    );
-
-    this.startHeartbeat(client.id, user.id);
-
-    // Push bulk online status to connecting user
-    this.chatService.getUserDMPeers(user.id).then(async (peerIds) => {
-      if (peerIds.length === 0) return;
-
-      const onlinePeers = await this.sessionService.getOnlineUsers(peerIds);
-      client.emit('presence:bulk', { online: Array.from(onlinePeers) });
-
-      // Notify each online peer that this user came online
-      for (const peerId of onlinePeers) {
-        const peerSocketId = await this.sessionService.getSession(peerId);
-        if (peerSocketId) {
-          this.server.to(peerSocketId).emit('user:joined', { userId: user.id, username: user.username });
-        }
-      }
-    }).catch((err) =>
+    this.pushPresence(client, user, socketCount === 1).catch((err) =>
       this.logger.warn(`Presence push failed: ${(err as Error).message}`),
     );
+  }
 
-    // Publish presence update for cross-server sync
-    this.pubSubService.publish('presence-updates', JSON.stringify({
-      type: 'online',
-      userId: user.id,
-      username: user.username,
-    })).catch(() => {});
-
-    client.emit('connected', {
-      userId: user.id,
-      username: user.username,
-      socketId: client.id,
-    });
+  private async pushPresence(client: Socket, user: SocketUser, firstSocket: boolean) {
+    const peerIds = await this.chatService.getUserDMPeers(user.id);
+    if (peerIds.length === 0) return;
+    const onlinePeers = await this.sessionService.getOnlineUsers(peerIds);
+    client.emit('presence:bulk', { online: Array.from(onlinePeers) });
+    if (firstSocket) {
+      this.socketService.emitToUsers(Array.from(onlinePeers), 'user:joined', {
+        userId: user.id,
+        username: user.username,
+      });
+    }
   }
 
   // ─── Disconnect ────────────────────────────────────────────────────────
 
   async handleDisconnect(@ConnectedSocket() client: Socket) {
-    const user: SocketUser = client.data.user;
+    this.stopHeartbeat(client.id);
+    this.clearTypingFor(client);
+
+    const user: SocketUser | undefined = client.data?.user;
     if (!user) return;
 
-    /* [SOCKET:DISCONNECT] */
-    this.logger.log(`[SOCKET:DISCONNECT] id=${client.id} user=${user.id} username=${user.username}`);
+    const remaining = await this.sessionService.removeSocket(user.id, client.id);
+    if (remaining !== 0) return;
 
-    this.logger.log(`Client disconnected: ${client.id} (user: ${user.username})`);
-
-    const interval = this.heartbeatIntervals.get(client.id);
-    if (interval) {
-      clearInterval(interval);
-      this.heartbeatIntervals.delete(client.id);
-    }
-
-    // Clean up IP tracking
-    const ip = (client.handshake.headers['x-forwarded-for'] as string) || client.handshake.address;
-    const ipSockets = this.ipConnections.get(ip);
-    if (ipSockets) {
-      ipSockets.delete(client.id);
-      if (ipSockets.size === 0) this.ipConnections.delete(ip);
-    }
-
-    // Atomic: get + delete in one Redis call — prevents race with new connection
-    const currentSocketId = await this.sessionService.getAndDeleteSession(user.id);
-    if (currentSocketId === client.id) {
-      // Session belonged to this socket — user is going offline
-      await this.sessionService.setOffline(user.id);
-
-      // Fire-and-forget: notify online DM peers
-      this.chatService.getUserDMPeers(user.id).then(async (peerIds) => {
-        for (const peerId of peerIds) {
-          const peerSocketId = await this.sessionService.getSession(peerId);
-          if (peerSocketId) {
-            this.server.to(peerSocketId).emit('user:left', { userId: user.id, username: user.username });
-          }
-        }
-      }).catch(() => {});
-
-      // Fire-and-forget: publish for cross-server sync
-      this.pubSubService.publish('presence-updates', JSON.stringify({
-        type: 'offline',
-        userId: user.id,
-      })).catch(() => {});
+    // Last live socket of this user (cluster-wide) is gone
+    await this.sessionService.setOffline(user.id);
+    try {
+      const peerIds = await this.chatService.getUserDMPeers(user.id);
+      this.socketService.emitToUsers(peerIds, 'user:left', { userId: user.id, username: user.username });
+    } catch (err) {
+      this.logger.warn(`Offline notify failed: ${(err as Error).message}`);
     }
   }
 
   // ─── Presence ─────────────────────────────────────────────────────────
 
+  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('presence:bulk')
-  async handlePresenceBulk(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { userIds?: string[] } | undefined,
-  ) {
+  async handlePresenceBulk(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-    if (!user) return { online: [] };
-
-    let userIds = Array.isArray(data?.userIds) ? data!.userIds!.filter(Boolean) : [];
-    if (userIds.length === 0) {
-      userIds = await this.chatService.getUserDMPeers(user.id);
+    try {
+      const dto = validatePayload(PresenceBulkDto, data ?? {});
+      let userIds = dto.userIds ?? [];
+      if (userIds.length === 0) userIds = await this.chatService.getUserDMPeers(user.id);
+      const online = await this.sessionService.getOnlineUsers(userIds);
+      return { success: true, online: Array.from(online) };
+    } catch (err) {
+      return toSocketError(err);
     }
-    if (userIds.length === 0) return { online: [] };
-
-    const online = await this.sessionService.getOnlineUsers(userIds);
-    return { online: Array.from(online) };
   }
 
   // ─── Create or Join Channel ──────────────────────────────────────────
 
   @UseGuards(SocketAuthGuard)
   @SubscribeMessage('create-or-join')
-  async handleCreateOrJoin(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { participantIds: string[]; type: string; name?: string },
-  ) {
+  async handleCreateOrJoin(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
     try {
-      const result = await this.chatService.createOrJoinChannel(
+      const dto = validatePayload(CreateChannelDto, data);
+      // Joins every member's sockets to the room and emits channel:created
+      const { channel, created } = await this.channelsService.create(
         user.id,
-        data.participantIds,
-        data.type,
-        data.name,
+        dto.participantIds,
+        dto.type,
+        dto.name,
       );
-
-      // Auto-join the room
-      this.socketService.joinChannel(client, result.channelId);
-
-      // Notify channel
-      this.server.to(`channel:${result.channelId}`).emit('user:joined', {
-        userId: user.id,
-        username: user.username,
-        channelId: result.channelId,
-      });
-
-      return { success: true, channelId: result.channelId, created: result.created };
+      await client.join(channelRoom(channel.id));
+      return { success: true, channelId: channel.id, created };
     } catch (err) {
-      const error = err as any;
-      return { success: false, error: error?.message };
+      return toSocketError(err);
     }
   }
 
-  // ─── Join Channel ──────────────────────────────────────────────────────
+  // ─── Join / Leave Channel room ─────────────────────────────────────────
+
+  private async requireMember(channelId: string, userId: string) {
+    if (!(await this.channelMembers.isMember(channelId, userId))) {
+      throw new SocketError('NOT_MEMBER', 'Not a member of this channel');
+    }
+  }
 
   @UseGuards(SocketAuthGuard)
   @SubscribeMessage('join-channel')
-  async handleJoinChannel(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string },
-  ) {
+  async handleJoinChannel(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
-    const isMember = await this.sessionService.isChannelMember(data.channelId, user.id);
-    if (!isMember) {
-      client.emit('error', { code: 'NOT_MEMBER', message: 'Not a member of this channel' });
-      return { success: false, error: 'NOT_MEMBER' };
+    try {
+      const { channelId } = validatePayload(ChannelIdDto, data);
+      await this.requireMember(channelId, user.id);
+      await client.join(channelRoom(channelId));
+      return { success: true };
+    } catch (err) {
+      return toSocketError(err);
     }
-
-    this.socketService.joinChannel(client, data.channelId);
-
-    // Notify channel that user joined
-    this.server.to(`channel:${data.channelId}`).emit('user:joined', {
-      userId: user.id,
-      username: user.username,
-      channelId: data.channelId,
-    });
-
-    return { success: true };
   }
-
-  // ─── Leave Channel ─────────────────────────────────────────────────────
 
   @UseGuards(SocketAuthGuard)
   @SubscribeMessage('leave-channel')
-  async handleLeaveChannel(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string },
-  ) {
+  async handleLeaveChannel(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
-    this.socketService.leaveChannel(client, data.channelId);
-
-    // Notify channel that user left
-    this.server.to(`channel:${data.channelId}`).emit('user:left', {
-      userId: user.id,
-      username: user.username,
-      channelId: data.channelId,
-    });
-
-    return { success: true };
+    try {
+      const { channelId } = validatePayload(ChannelIdDto, data);
+      await this.requireMember(channelId, user.id);
+      await client.leave(channelRoom(channelId));
+      return { success: true };
+    } catch (err) {
+      return toSocketError(err);
+    }
   }
 
   // ─── Typing Indicators ────────────────────────────────────────────────
 
   @UseGuards(SocketAuthGuard)
   @SubscribeMessage('typing:start')
-  async handleTypingStart(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string },
-  ) {
+  async handleTypingStart(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
+    try {
+      const { channelId } = validatePayload(ChannelIdDto, data);
+      const rl = await this.rateLimitService.checkRateLimit(`typing:${user.id}`, RateLimitService.TYPING);
+      if (!rl.allowed) throw new SocketError('RATE_LIMITED', 'Too many typing events');
+      await this.requireMember(channelId, user.id);
 
-    // Rate limit typing events
-    const rl = await this.rateLimitService.checkRateLimit(
-      `typing:${user.id}`,
-      RateLimitService.TYPING,
-    );
-    if (!rl.allowed) return;
+      const timeoutKey = `${client.id}|${channelId}`;
+      const existing = this.typingTimeouts.get(timeoutKey);
+      if (existing) clearTimeout(existing);
 
-    // Clear any existing timeout for this user+channel
-    const timeoutKey = `${user.id}:${data.channelId}`;
-    const existing = this.typingTimeouts.get(timeoutKey);
-    if (existing) clearTimeout(existing);
+      await this.cacheService.setTyping(channelId, user.id);
+      this.emitTyping('typing:start', user, channelId);
 
-    await this.cacheService.setTyping(data.channelId, user.id);
-
-    client.to(`channel:${data.channelId}`).emit('typing:start', {
-      userId: user.id,
-      username: user.username,
-      channelId: data.channelId,
-    });
-
-    // Auto-broadcast typing:stop after 6s if client doesn't send it
-    const timeout = setTimeout(async () => {
-      this.typingTimeouts.delete(timeoutKey);
-      await this.cacheService.clearTyping(data.channelId, user.id);
-      client.to(`channel:${data.channelId}`).emit('typing:stop', {
-        userId: user.id,
-        username: user.username,
-        channelId: data.channelId,
-      });
-    }, 6000);
-    this.typingTimeouts.set(timeoutKey, timeout);
+      this.typingTimeouts.set(
+        timeoutKey,
+        setTimeout(() => {
+          this.typingTimeouts.delete(timeoutKey);
+          this.stopTyping(user, channelId);
+        }, TYPING_AUTO_STOP_MS),
+      );
+      return { success: true };
+    } catch (err) {
+      return toSocketError(err);
+    }
   }
 
   @UseGuards(SocketAuthGuard)
   @SubscribeMessage('typing:stop')
-  async handleTypingStop(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string },
-  ) {
+  async handleTypingStop(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
+    try {
+      const { channelId } = validatePayload(ChannelIdDto, data);
+      const rl = await this.rateLimitService.checkRateLimit(`typing:${user.id}`, RateLimitService.TYPING);
+      if (!rl.allowed) throw new SocketError('RATE_LIMITED', 'Too many typing events');
+      await this.requireMember(channelId, user.id);
 
-    const rl = await this.rateLimitService.checkRateLimit(
-      `typing:${user.id}`,
-      RateLimitService.TYPING,
-    );
-    if (!rl.allowed) return;
-
-    // Clear the auto-timeout
-    const timeoutKey = `${user.id}:${data.channelId}`;
-    const existing = this.typingTimeouts.get(timeoutKey);
-    if (existing) {
-      clearTimeout(existing);
-      this.typingTimeouts.delete(timeoutKey);
+      const timeoutKey = `${client.id}|${channelId}`;
+      const existing = this.typingTimeouts.get(timeoutKey);
+      if (existing) {
+        clearTimeout(existing);
+        this.typingTimeouts.delete(timeoutKey);
+      }
+      this.stopTyping(user, channelId);
+      return { success: true };
+    } catch (err) {
+      return toSocketError(err);
     }
+  }
 
-    await this.cacheService.clearTyping(data.channelId, user.id);
+  private emitTyping(event: 'typing:start' | 'typing:stop', user: SocketUser, channelId: string) {
+    this.socketService.emitToChannel(
+      channelId,
+      event,
+      { userId: user.id, username: user.username, channelId },
+      { exceptUserId: user.id },
+    );
+  }
 
-    client.to(`channel:${data.channelId}`).emit('typing:stop', {
-      userId: user.id,
-      username: user.username,
-      channelId: data.channelId,
-    });
+  private stopTyping(user: SocketUser, channelId: string) {
+    this.cacheService.clearTyping(channelId, user.id).catch(() => undefined);
+    this.emitTyping('typing:stop', user, channelId);
+  }
+
+  private clearTypingFor(client: Socket) {
+    const user: SocketUser | undefined = client.data?.user;
+    const prefix = `${client.id}|`;
+    for (const [key, timeout] of this.typingTimeouts) {
+      if (!key.startsWith(prefix)) continue;
+      clearTimeout(timeout);
+      this.typingTimeouts.delete(key);
+      if (user) this.stopTyping(user, key.slice(prefix.length));
+    }
   }
 
   // ─── Heartbeat ─────────────────────────────────────────────────────────
 
   @SubscribeMessage('heartbeat')
   async handleHeartbeat(@ConnectedSocket() client: Socket) {
-    const user: SocketUser = client.data.user;
-    if (!user) return;
-
-    await this.sessionService.renewSession(user.id, client.id);
-    await this.sessionService.setOnline(user.id);
-
-    client.emit('heartbeat-ack', { timestamp: Date.now() });
+    const user: SocketUser | undefined = client.data?.user;
+    if (!user) return { success: false, error: 'NOT_AUTHENTICATED', message: 'Authentication required' };
+    if (!(await this.beat(client))) {
+      return { success: false, error: 'NOT_AUTHENTICATED', message: 'Token expired' };
+    }
+    const timestamp = Date.now();
+    client.emit('heartbeat-ack', { timestamp });
+    return { success: true, timestamp };
   }
 
-  // ─── Private: Heartbeat Interval ───────────────────────────────────────
+  /** Refreshes liveness; disconnects with TOKEN_EXPIRED once the JWT expires. */
+  private async beat(client: Socket): Promise<boolean> {
+    const user: SocketUser | undefined = client.data?.user;
+    if (!user) return false;
+    if (isTokenExpired(client.data as SocketData)) {
+      this.rejectConnection(client, 'TOKEN_EXPIRED', 'Token expired');
+      return false;
+    }
+    await this.sessionService.refreshSocket(user.id, client.id);
+    await this.sessionService.setOnline(user.id);
+    return true;
+  }
 
-  private startHeartbeat(socketId: string, userId: string) {
-    const interval = setInterval(async () => {
-      // Check if socket is still alive
-      const socket = this.server.sockets.sockets.get(socketId);
-      if (!socket) {
-        clearInterval(interval);
-        this.heartbeatIntervals.delete(socketId);
+  private startHeartbeat(client: Socket) {
+    this.stopHeartbeat(client.id);
+    const interval = setInterval(() => {
+      if (!client.connected) {
+        this.stopHeartbeat(client.id);
         return;
       }
+      this.beat(client).catch(() => undefined);
+    }, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatIntervals.set(client.id, interval);
+  }
 
-      // Renew session TTL
-      await this.sessionService.renewSession(userId, socketId);
-      await this.sessionService.setOnline(userId);
-    }, 30_000); // Every 30 seconds
-
-    this.heartbeatIntervals.set(socketId, interval);
+  private stopHeartbeat(socketId: string) {
+    const interval = this.heartbeatIntervals.get(socketId);
+    if (interval) {
+      clearInterval(interval);
+      this.heartbeatIntervals.delete(socketId);
+    }
   }
 }

@@ -6,48 +6,48 @@ import {
   UploadedFile,
   BadRequestException,
 } from '@nestjs/common';
-import { AuthGuard } from '@nestjs/passport';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { JwtAuthGuard } from '../../shared/guards/jwt-auth.guard';
+import { RateLimit, RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { UploadsService } from './uploads.service';
+import { detectAllowedMime, IMAGE_MIMES } from './file-type';
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-const ALLOWED_FILE_TYPES = [
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'text/plain',
-];
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+interface IncomingFile {
+  buffer: Buffer;
+  mimetype: string;
+  originalname: string;
+  size: number;
+}
 
 @Controller('uploads')
-@UseGuards(AuthGuard('jwt'))
+@UseGuards(JwtAuthGuard, RateLimitGuard)
 export class UploadsController {
   constructor(private uploadsService: UploadsService) {}
 
   @Post()
+  @RateLimit({ scope: 'upload', limit: 20, windowMs: 60_000, byUser: true })
   @UseInterceptors(
     FileInterceptor('file', {
-      limits: { fileSize: MAX_FILE_SIZE },
+      limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 10 },
     }),
   )
-  async uploadFile(@UploadedFile() file: { buffer: Buffer; mimetype: string; originalname: string; size: number }) {
-    if (!file) {
+  async uploadFile(@UploadedFile() file: IncomingFile | undefined) {
+    if (!file || !file.buffer || file.size === 0) {
       throw new BadRequestException('No file provided');
     }
 
-    const isImage = ALLOWED_IMAGE_TYPES.includes(file.mimetype);
-    const isFile = ALLOWED_FILE_TYPES.includes(file.mimetype);
-
-    if (!isImage && !isFile) {
+    const mime = detectAllowedMime(file.buffer, file.mimetype);
+    if (!mime) {
       throw new BadRequestException(
-        `Unsupported file type: ${file.mimetype}. Allowed: images (JPEG, PNG, GIF, WebP) and documents (PDF, DOC, DOCX, TXT)`,
+        'Unsupported file type. Allowed: images (JPEG, PNG, GIF, WebP) and documents (PDF, DOC, DOCX, TXT)',
       );
     }
 
-    if (isImage) {
-      return this.uploadsService.uploadImage(file);
-    }
-
-    return this.uploadsService.uploadFile(file);
+    const verified = { ...file, mimetype: mime };
+    return IMAGE_MIMES.has(mime)
+      ? this.uploadsService.uploadImage(verified)
+      : this.uploadsService.uploadFile(verified);
   }
 }

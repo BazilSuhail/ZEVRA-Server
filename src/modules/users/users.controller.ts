@@ -1,7 +1,8 @@
-import { Controller, Get, Put, Param, Query, Body, UseGuards, Request } from '@nestjs/common';
+import { Controller, Get, Put, Param, Query, Body, UseGuards, Request, ParseUUIDPipe } from '@nestjs/common';
 import { UsersService } from './users.service';
 import { RedisSessionService } from '../../redis/redis-session.service';
 import { JwtAuthGuard } from '../../shared/guards/jwt-auth.guard';
+import { OnlineUsersQueryDto, SearchUsersQueryDto, UpdateProfileDto } from './dto/users.dto';
 
 @Controller('api/users')
 @UseGuards(JwtAuthGuard)
@@ -12,30 +13,23 @@ export class UsersController {
   ) {}
 
   @Put('me')
-  updateMe(@Request() req: any, @Body() body: { username?: string }) {
-    return this.usersService.updateProfile(req.user.id, body);
+  updateMe(@Request() req: { user: { id: string } }, @Body() body: UpdateProfileDto) {
+    return this.usersService.updateProfile(req.user.id, body.username);
   }
 
   @Get('search')
-  search(
-    @Request() req: any,
-    @Query('q') query: string,
-    @Query('limit') limit?: string,
-  ) {
-    return this.usersService.search(query, req.user.id, limit ? parseInt(limit) : 20);
+  search(@Request() req: { user: { id: string } }, @Query() query: SearchUsersQueryDto) {
+    return this.usersService.search(query.q, req.user.id, query.limit);
   }
 
   @Get('online')
-  async getOnline(@Query('ids') ids: string) {
-    const userIds = ids
-      ? ids.split(',').filter((id) => id.trim().length > 0)
-      : [];
-    const online = await this.sessionService.getOnlineUsers(userIds);
+  async getOnline(@Query() query: OnlineUsersQueryDto) {
+    const online = await this.sessionService.getOnlineUsers(query.ids);
     return { online: Array.from(online) };
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.usersService.findById(id);
+  findOne(@Param('id', new ParseUUIDPipe()) id: string) {
+    return this.usersService.findPublicById(id);
   }
 }

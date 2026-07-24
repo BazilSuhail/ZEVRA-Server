@@ -1,7 +1,7 @@
 import { Controller, Get, Query, UseGuards, Request } from '@nestjs/common';
-import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../../shared/guards/jwt-auth.guard';
 import { AuditService } from './audit.service';
+import { AuditLogsQueryDto } from './dto/audit-query.dto';
 
 @Controller('api/audit')
 @UseGuards(JwtAuthGuard)
@@ -9,29 +9,20 @@ export class AuditController {
   constructor(private auditService: AuditService) {}
 
   @Get('logs')
-  @Throttle({ default: { limit: 10000, ttl: 60000 } })
-  async getLogs(
-    @Request() req: any,
-    @Query('action') action?: string,
-    @Query('from') from?: string,
-    @Query('to') to?: string,
-    @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
-  ) {
+  async getLogs(@Request() req: { user: { id: string } }, @Query() query: AuditLogsQueryDto) {
     const logs = await this.auditService.getLogs({
       userId: req.user.id,
-      action,
-      from: from ? new Date(from) : undefined,
-      to: to ? new Date(to) : undefined,
-      limit: limit ? parseInt(limit) : 100,
-      offset: offset ? parseInt(offset) : 0,
+      action: query.action,
+      from: query.from ? new Date(query.from) : undefined,
+      to: query.to ? new Date(query.to) : undefined,
+      limit: query.limit,
+      offset: query.offset,
     });
     return { success: true, logs };
   }
 
   @Get('security')
-  @Throttle({ default: { limit: 10000, ttl: 60000 } })
-  async getSecurityEvents(@Request() req: any) {
+  async getSecurityEvents(@Request() req: { user: { id: string } }) {
     const events = await this.auditService.getSecurityEvents(req.user.id);
     return { success: true, events };
   }

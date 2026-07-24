@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import * as crypto from 'node:crypto';
 
 /**
@@ -57,9 +57,38 @@ function hkdf(ikm: Buffer, info: Buffer, length = 32): Buffer {
   return Buffer.from(crypto.hkdfSync('sha256', ikm, Buffer.alloc(0), info, length));
 }
 
+const MAX_A_HEX_LENGTH = 1024;
+
 @Injectable()
 export class SrpService {
-  private readonly logger = new Logger(SrpService.name);
+  /**
+   * A is a client-supplied hex string. Rejects non-hex, empty or oversized
+   * values and values that are 0 mod N (which would force S = 0).
+   */
+  parseClientEphemeral(hex: string): bigint | null {
+    if (typeof hex !== 'string' || hex.length === 0 || hex.length > MAX_A_HEX_LENGTH) return null;
+    if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
+    const A = BigInt('0x' + hex);
+    if (A % N === 0n) return null;
+    return A;
+  }
+
+  /**
+   * Deterministic decoy salt + verifier for usernames that do not exist (or
+   * are inactive), so login/start responses do not reveal account existence.
+   */
+  decoyCredentials(username: string, secret: string): { srpSalt: string; verifier: bigint } {
+    const srpSalt = crypto
+      .createHmac('sha256', secret)
+      .update(`zevra-srp-salt:${username}`)
+      .digest()
+      .subarray(0, 16)
+      .toString('hex');
+    const x = bufferToBigInt(
+      crypto.createHmac('sha256', secret).update(`zevra-srp-x:${username}`).digest(),
+    );
+    return { srpSalt, verifier: this.computeVerifier(x) };
+  }
 
   /**
    * Compute SRP verifier from password + salt.
@@ -130,7 +159,8 @@ export class SrpService {
     }
 
     const expectedM1 = sha256(xorHN_HG, hSalt, bigintToBuffer(A), bigintToBuffer(B), K);
-    const valid = expectedM1.toString('hex') === M1;
+    const provided = /^[0-9a-fA-F]{64}$/.test(M1) ? Buffer.from(M1, 'hex') : Buffer.alloc(0);
+    const valid = provided.length === expectedM1.length && crypto.timingSafeEqual(provided, expectedM1);
 
     if (!valid) {
       return { valid: false, M2: '', K: Buffer.alloc(0) };

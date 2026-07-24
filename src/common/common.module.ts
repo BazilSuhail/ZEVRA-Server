@@ -1,8 +1,10 @@
-import { Module } from '@nestjs/common';
-import { HttpExceptionFilter } from './exception.filter';
+import { Global, Module } from '@nestjs/common';
+import { RedisRateLimiter } from './rate-limit/redis-rate-limiter';
+import { RateLimitGuard } from './guards/rate-limit.guard';
 
+@Global()
 @Module({
-  providers: [HttpExceptionFilter],
-  exports: [HttpExceptionFilter],
+  providers: [RedisRateLimiter, RateLimitGuard],
+  exports: [RedisRateLimiter, RateLimitGuard],
 })
 export class CommonModule {}

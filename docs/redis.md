@@ -1,3 +1,5 @@
+> **Note:** This document predates the November 2026 fix pass. [API.md](../API.md) is authoritative wherever the two differ (ports, endpoints, socket events, rate limits, Redis keys, sessions, env vars, migrations).
+
 # Redis
 
 Redis serves 8 distinct roles in ZEVRA. All backed by a single Redis Cloud instance (Redis Labs).

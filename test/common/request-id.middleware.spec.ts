@@ -31,6 +31,15 @@ describe('RequestIdMiddleware', () => {
     expect(mockReq.requestId).toBe('existing-id-123');
   });
 
+  it('replaces unsafe incoming ids', () => {
+    mockReq.headers['x-request-id'] = 'bad id\nInjected: log line';
+
+    middleware.use(mockReq, mockRes, mockNext);
+
+    expect(mockReq.requestId).not.toContain('\n');
+    expect(mockReq.requestId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
   it('always calls next()', () => {
     middleware.use(mockReq, mockRes, mockNext);
     expect(mockNext).toHaveBeenCalledTimes(1);

@@ -1,3 +1,5 @@
+> **Note:** This document predates the November 2026 fix pass. [API.md](../API.md) is authoritative wherever the two differ (ports, endpoints, socket events, rate limits, Redis keys, sessions, env vars, migrations).
+
 # Database
 
 PostgreSQL (Neon) via Drizzle ORM. Schema defined in `src/database/schema.ts`, migrations in `drizzle/`.

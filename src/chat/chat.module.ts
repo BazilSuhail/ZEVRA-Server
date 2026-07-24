@@ -1,24 +1,14 @@
-import { Module, forwardRef } from '@nestjs/common';
-import { BullModule } from '@nestjs/bullmq';
+import { Module } from '@nestjs/common';
 import { ChatService } from './chat.service';
 import { ChatGateway } from './chat.gateway';
-import { SocketModule } from '../socket/socket.module';
-import { RedisModule } from '../redis/redis.module';
+import { SocketAuthGuard } from '../socket/socket-auth.guard';
 import { MessagesModule } from '../modules/messages/messages.module';
 import { ReactionsModule } from '../modules/reactions/reactions.module';
+import { ChannelsModule } from '../modules/channels/channels.module';
 
 @Module({
-  imports: [
-    RedisModule,
-    MessagesModule,
-    BullModule.registerQueue(
-      { name: 'message-delivery' },
-      { name: 'read-receipt' },
-    ),
-    forwardRef(() => SocketModule),
-    ReactionsModule,
-  ],
-  providers: [ChatService, ChatGateway],
+  imports: [MessagesModule, ReactionsModule, ChannelsModule],
+  providers: [ChatService, ChatGateway, SocketAuthGuard],
   exports: [ChatService],
 })
 export class ChatModule {}

@@ -1,177 +1,169 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { RedisClientType } from 'redis';
+import { RedisService } from './redis.service';
+import { MESSAGE_CACHE_SIZE, RedisKeys, RedisTtl } from './redis-keys';
 
 @Injectable()
 export class RedisCacheService {
   private readonly logger = new Logger(RedisCacheService.name);
-  private client: RedisClientType | null = null;
 
-  setClient(client: RedisClientType | null) {
-    this.client = client;
+  constructor(private readonly redis: RedisService) {}
+
+  private get client() {
+    return this.redis.getClient();
   }
 
   // ─── Recent Messages Cache ──────────────────────────────────────────────
 
-  async cacheMessage(channelId: string, message: object, maxItems = 50): Promise<void> {
-    if (!this.client) return;
+  async cacheMessage(channelId: string, message: object): Promise<void> {
+    const client = this.client;
+    if (!client) return;
     try {
-      const key = `cache:messages:${channelId}`;
-      await this.client.rPush(key, JSON.stringify(message));
-      await this.client.lTrim(key, -maxItems, -1);
-      await this.client.expire(key, 86400);
+      const key = RedisKeys.messageCache(channelId);
+      await client
+        .multi()
+        .rPush(key, JSON.stringify(message))
+        .lTrim(key, -MESSAGE_CACHE_SIZE, -1)
+        .expire(key, RedisTtl.messageCacheSeconds)
+        .exec();
     } catch (err) {
       this.logger.warn(`cacheMessage failed: ${(err as Error).message}`);
     }
   }
 
-  async getRecentMessages(channelId: string, limit = 50): Promise<object[]> {
-    if (!this.client) return [];
+  /** Last `limit` cached items (newest page) in insertion order. */
+  async getRecentMessages<T = unknown>(channelId: string, limit = MESSAGE_CACHE_SIZE): Promise<T[]> {
+    const client = this.client;
+    if (!client) return [];
     try {
-      const key = `cache:messages:${channelId}`;
-      // Return the LAST `limit` items (newest page), ascending
-      const items = await this.client.lRange(key, -limit, -1);
-      return items.map((item) => JSON.parse(item));
+      const items = await client.lRange(RedisKeys.messageCache(channelId), -limit, -1);
+      return items.map((item) => JSON.parse(item) as T);
     } catch {
       return [];
     }
   }
 
   async invalidateMessages(channelId: string): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client) return;
     try {
-      await this.client.del(`cache:messages:${channelId}`);
-    } catch {}
+      await client.del(RedisKeys.messageCache(channelId));
+    } catch (err) {
+      this.logger.warn(`invalidateMessages failed: ${(err as Error).message}`);
+    }
   }
 
   // ─── Unread Counts ─────────────────────────────────────────────────────
 
   async incrementUnread(userId: string, channelId: string): Promise<number> {
-    if (!this.client) return 0;
+    const client = this.client;
+    if (!client) return 0;
     try {
-      const key = `cache:unread:${userId}:${channelId}`;
-      const count = await this.client.incr(key);
-      await this.client.expire(key, 604800);
-      return count;
+      const key = RedisKeys.unread(userId, channelId);
+      const [count] = await client.multi().incr(key).expire(key, RedisTtl.unreadSeconds).exec();
+      return Number(count ?? 0);
     } catch {
       return 0;
+    }
+  }
+
+  /** Increments the channel's unread counter for many users in one round trip. */
+  async incrementUnreadMany(userIds: string[], channelId: string): Promise<void> {
+    const client = this.client;
+    if (!client || userIds.length === 0) return;
+    try {
+      const multi = client.multi();
+      for (const userId of userIds) {
+        const key = RedisKeys.unread(userId, channelId);
+        multi.incr(key);
+        multi.expire(key, RedisTtl.unreadSeconds);
+      }
+      await multi.exec();
+    } catch (err) {
+      this.logger.warn(`incrementUnreadMany failed: ${(err as Error).message}`);
     }
   }
 
   async getUnreadCount(userId: string, channelId: string): Promise<number> {
-    if (!this.client) return 0;
+    const client = this.client;
+    if (!client) return 0;
     try {
-      const val = await this.client.get(`cache:unread:${userId}:${channelId}`);
-      return val ? parseInt(val, 10) : 0;
+      const val = await client.get(RedisKeys.unread(userId, channelId));
+      return val ? parseInt(String(val), 10) || 0 : 0;
     } catch {
       return 0;
     }
   }
 
+  /** One MGET for all channels; absent keys count as 0. */
   async getUnreadCounts(userId: string, channelIds: string[]): Promise<Record<string, number>> {
-    if (!this.client || channelIds.length === 0) return {};
+    const result: Record<string, number> = {};
+    for (const id of channelIds) result[id] = 0;
+    const client = this.client;
+    if (!client || channelIds.length === 0) return result;
     try {
-      const keys = channelIds.map((id) => `cache:unread:${userId}:${id}`);
-      const values = await this.client.mGet(keys);
-      const result: Record<string, number> = {};
-      for (let i = 0; i < channelIds.length; i++) {
-        result[channelIds[i]] = values[i] ? parseInt(values[i]!, 10) : 0;
-      }
-      return result;
-    } catch {
-      return {};
+      const values = await client.mGet(channelIds.map((id) => RedisKeys.unread(userId, id)));
+      channelIds.forEach((id, i) => {
+        const v = values[i];
+        result[id] = v ? parseInt(String(v), 10) || 0 : 0;
+      });
+    } catch (err) {
+      this.logger.warn(`getUnreadCounts failed: ${(err as Error).message}`);
     }
+    return result;
   }
 
   async resetUnread(userId: string, channelId: string): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client) return;
     try {
-      await this.client.del(`cache:unread:${userId}:${channelId}`);
-    } catch {}
-  }
-
-  async resetUnreads(userId: string, channelIds: string[]): Promise<void> {
-    if (!this.client || channelIds.length === 0) return;
-    try {
-      const keys = channelIds.map((id) => `cache:unread:${userId}:${id}`);
-      await this.client.del(keys);
-    } catch {}
-  }
-
-  // ─── Group Info Cache ──────────────────────────────────────────────────
-
-  async cacheGroupInfo(groupId: string, info: object, ttl = 3600): Promise<void> {
-    if (!this.client) return;
-    try {
-      const key = `cache:group:${groupId}`;
-      await this.client.hSet(key, Object.entries(info).map(([k, v]) => [k, String(v)]));
-      await this.client.expire(key, ttl);
-    } catch {}
-  }
-
-  async getGroupInfo(groupId: string): Promise<Record<string, string> | null> {
-    if (!this.client) return null;
-    try {
-      const result = await this.client.hGetAll(`cache:group:${groupId}`);
-      return Object.keys(result).length > 0 ? result : null;
-    } catch {
-      return null;
+      await client.del(RedisKeys.unread(userId, channelId));
+    } catch (err) {
+      this.logger.warn(`resetUnread failed: ${(err as Error).message}`);
     }
   }
 
-  async invalidateGroupInfo(groupId: string): Promise<void> {
-    if (!this.client) return;
-    try {
-      await this.client.del(`cache:group:${groupId}`);
-    } catch {}
-  }
+  // ─── Typing Indicators (per-channel sorted set, score = expiry ms) ─────
 
-  // ─── Typing Indicators ─────────────────────────────────────────────────
-
-  async setTyping(channelId: string, userId: string, ttlSeconds = 5): Promise<void> {
-    if (!this.client) return;
+  async setTyping(channelId: string, userId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
     try {
-      await this.client.setEx(`typing:${channelId}:${userId}`, ttlSeconds, '1');
-    } catch {}
+      const key = RedisKeys.typing(channelId);
+      await client
+        .multi()
+        .zAdd(key, { score: Date.now() + RedisTtl.typingEntryMs, value: userId })
+        .expire(key, RedisTtl.typingSeconds)
+        .exec();
+    } catch {
+      // Typing state is best-effort
+    }
   }
 
   async clearTyping(channelId: string, userId: string): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client) return;
     try {
-      await this.client.del(`typing:${channelId}:${userId}`);
-    } catch {}
-  }
-
-  async getTypingUsers(channelId: string): Promise<string[]> {
-    if (!this.client) return [];
-    try {
-      const pattern = `typing:${channelId}:*`;
-      const keys: string[] = [];
-      for await (const key of this.client.scanIterator({ MATCH: pattern, COUNT: 100 })) {
-        keys.push(String(key));
-      }
-      return keys.map((key) => key.split(':').pop()!);
+      await client.zRem(RedisKeys.typing(channelId), userId);
     } catch {
-      return [];
+      // Typing state is best-effort
     }
   }
 
-  // ─── Read Receipts Cache ───────────────────────────────────────────────
-
-  async cacheReadReceipt(channelId: string, userId: string, messageId: string): Promise<void> {
-    if (!this.client) return;
+  async getTypingUsers(channelId: string): Promise<string[]> {
+    const client = this.client;
+    if (!client) return [];
     try {
-      const key = `cache:read_receipts:${channelId}`;
-      await this.client.hSet(key, userId, messageId);
-      await this.client.expire(key, 300);
-    } catch {}
-  }
-
-  async getReadReceipts(channelId: string): Promise<Record<string, string>> {
-    if (!this.client) return {};
-    try {
-      return await this.client.hGetAll(`cache:read_receipts:${channelId}`);
+      const key = RedisKeys.typing(channelId);
+      const now = Date.now();
+      const results = await client
+        .multi()
+        .zRemRangeByScore(key, '-inf', now)
+        .zRangeByScore(key, now, '+inf')
+        .exec();
+      const users = results[1];
+      return Array.isArray(users) ? users.map(String) : [];
     } catch {
-      return {};
+      return [];
     }
   }
 }

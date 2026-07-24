@@ -1,53 +1,83 @@
+import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { Logger, ValidationPipe } from '@nestjs/common';
-import { AppModule } from './app.module';
-import { HttpExceptionFilter } from './common/exception.filter';
+import { Logger } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import helmet from 'helmet';
+import { AppModule } from './app.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { createValidationPipe } from './common/pipes/validation';
+import { getCorsOrigins, validateEnv } from './common/config';
+
+const logger = new Logger('Bootstrap');
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+let app: NestExpressApplication | undefined;
+let shuttingDown = false;
+
+async function shutdownAfterFatal(reason: string, err: unknown): Promise<void> {
+  logger.error(reason, err instanceof Error ? err.stack : String(err));
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const force = setTimeout(() => process.exit(1), SHUTDOWN_TIMEOUT_MS);
+  force.unref();
+  try {
+    await app?.close();
+  } catch (closeErr) {
+    logger.error(`Error during shutdown: ${(closeErr as Error).message}`);
+  } finally {
+    process.exit(1);
+  }
+}
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', reason instanceof Error ? reason.stack : String(reason));
+});
+
+process.on('uncaughtException', (err) => {
+  void shutdownAfterFatal('Uncaught exception', err);
+});
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, {
+  validateEnv();
+
+  app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: ['error', 'warn', 'log'],
+    rawBody: true,
   });
+
+  // LiveKit webhooks are sent as application/webhook+json; parse them as JSON
+  // so the raw body is captured for signature verification.
+  app.useBodyParser('json', { type: 'application/webhook+json', limit: '1mb' });
+
+  if (process.env.TRUST_PROXY) {
+    const value = process.env.TRUST_PROXY;
+    app.set('trust proxy', /^\d+$/.test(value) ? Number(value) : value === 'true' ? true : value);
+  }
 
   app.use(helmet());
 
+  const origins = getCorsOrigins();
   app.enableCors({
-    origin: process.env.CORS_ORIGIN || '*',
+    origin: origins,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
-    allowedHeaders: 'Content-Type, Authorization',
+    allowedHeaders: 'Content-Type, Authorization, X-Request-Id',
+    exposedHeaders: 'X-Request-Id, Retry-After',
     credentials: true,
   });
 
-  app.useGlobalPipes(
-    new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-  );
+  app.useGlobalPipes(createValidationPipe());
+  app.useGlobalFilters(new AllExceptionsFilter());
 
-  app.useGlobalFilters(new HttpExceptionFilter());
+  // SIGTERM/SIGINT → app.close(): runs onModuleDestroy/onApplicationShutdown
+  // hooks (HTTP server, Socket.IO, Redis clients, pg pool).
+  app.enableShutdownHooks(['SIGTERM', 'SIGINT']);
 
-  // Graceful shutdown
-  const logger = new Logger('Bootstrap');
-  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
-
-  for (const signal of signals) {
-    process.on(signal, async () => {
-      logger.log(`Received ${signal}, shutting down gracefully...`);
-      await app.close();
-      logger.log('Application closed');
-      process.exit(0);
-    });
-  }
-
-  process.on('unhandledRejection', (reason) => {
-    logger.error('Unhandled Rejection:', reason);
-  });
-
-  process.on('uncaughtException', (err) => {
-    logger.error('Uncaught Exception:', err);
-    process.exit(1);
-  });
-
-  const port = process.env.PORT ?? 3000;
+  const port = Number(process.env.PORT) || 3000;
   await app.listen(port);
-  logger.log(`Application running on http://localhost:${port}`);
+  logger.log(`Listening on port ${port} (CORS origins: ${origins.join(', ') || 'none'})`);
 }
-bootstrap();
+
+bootstrap().catch((err) => {
+  logger.error('Failed to start', err instanceof Error ? err.stack ?? err.message : String(err));
+  process.exit(1);
+});

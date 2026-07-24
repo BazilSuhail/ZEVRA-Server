@@ -1,7 +1,34 @@
-import { IsString, IsInt, IsArray, IsUUID, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
+  IsInt,
+  IsString,
+  IsUUID,
+  MaxLength,
+  Min,
+  MinLength,
+  ValidateNested,
+} from 'class-validator';
+
+export class SenderKeyItemDto {
+  @IsUUID()
+  receiverId!: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(4096)
+  encryptedKey!: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(1024)
+  keySignature!: string;
+}
 
 export class UploadSenderKeyDto {
-  @IsString()
+  @IsUUID()
   groupId!: string;
 
   @IsInt()
@@ -9,9 +36,9 @@ export class UploadSenderKeyDto {
   epoch!: number;
 
   @IsArray()
-  items!: {
-    receiverId: string;
-    encryptedKey: string;
-    keySignature: string;
-  }[];
+  @ArrayMinSize(1)
+  @ArrayMaxSize(500)
+  @ValidateNested({ each: true })
+  @Type(() => SenderKeyItemDto)
+  items!: SenderKeyItemDto[];
 }

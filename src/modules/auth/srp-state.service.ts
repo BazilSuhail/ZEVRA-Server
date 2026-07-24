@@ -1,34 +1,67 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { RedisService } from '../../redis/redis.service';
 
-interface SrpState {
+export interface SrpState {
   b: bigint;
   B: bigint;
-  createdAt: number;
+  /** null when the login was started for an unknown/inactive username. */
+  userId: string | null;
 }
 
-const TTL_MS = 5 * 60 * 1000; // 5 minutes
+interface StoredSrpState {
+  b: string;
+  B: string;
+  userId: string | null;
+}
 
+export const SRP_STATE_TTL_SECONDS = 120;
+
+/**
+ * SRP handshake state kept in Redis under `zevra:srp:{username}` so it works
+ * across instances. Entries expire after 120s and are consumed exactly once
+ * (GETDEL) when the login is finished.
+ */
 @Injectable()
 export class SrpStateService {
-  private store = new Map<string, SrpState>();
+  private readonly logger = new Logger(SrpStateService.name);
 
-  set(userId: string, state: Omit<SrpState, 'createdAt'>): void {
-    this.store.set(userId, { ...state, createdAt: Date.now() });
+  constructor(private readonly redisService: RedisService) {}
+
+  private key(username: string): string {
+    return `zevra:srp:${username}`;
   }
 
-  get(userId: string): SrpState | null {
-    const state = this.store.get(userId);
-    if (!state) return null;
+  private client() {
+    const client = this.redisService.getClient();
+    if (!client) {
+      throw new ServiceUnavailableException('Login is temporarily unavailable');
+    }
+    return client;
+  }
 
-    if (Date.now() - state.createdAt > TTL_MS) {
-      this.store.delete(userId);
+  async set(username: string, state: SrpState): Promise<void> {
+    const value: StoredSrpState = {
+      b: state.b.toString(16),
+      B: state.B.toString(16),
+      userId: state.userId,
+    };
+    await this.client().set(this.key(username), JSON.stringify(value), { EX: SRP_STATE_TTL_SECONDS });
+  }
+
+  /** Returns and deletes the state atomically (single use). */
+  async consume(username: string): Promise<SrpState | null> {
+    const raw = await this.client().getDel(this.key(username));
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(String(raw)) as StoredSrpState;
+      return {
+        b: BigInt('0x' + parsed.b),
+        B: BigInt('0x' + parsed.B),
+        userId: parsed.userId,
+      };
+    } catch (err) {
+      this.logger.warn(`Corrupt SRP state discarded: ${(err as Error).message}`);
       return null;
     }
-
-    return state;
-  }
-
-  delete(userId: string): void {
-    this.store.delete(userId);
   }
 }

@@ -1,3 +1,5 @@
+> **Note:** This document predates the November 2026 fix pass. [API.md](../API.md) is authoritative wherever the two differ (ports, endpoints, socket events, rate limits, Redis keys, sessions, env vars, migrations).
+
 # End-to-End Encryption
 
 ZEVRA implements a zero-knowledge architecture. The server never sees plaintext passwords, messages, or private keys.

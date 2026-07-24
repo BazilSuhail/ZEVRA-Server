@@ -40,7 +40,7 @@ describe('SocketAuthGuard', () => {
     mockDb.where.mockResolvedValue([{ id: 'user-1', username: 'test', email: 'test@test.com', status: 'online' }]);
 
     expect(await guard.canActivate(mockContext)).toBe(true);
-    expect(mockJwt.verifyAsync).toHaveBeenCalledWith('my-token');
+    expect(mockJwt.verifyAsync).toHaveBeenCalledWith('my-token', { algorithms: ['HS256'] });
   });
 
   it('extracts token from Authorization header', async () => {
@@ -49,7 +49,7 @@ describe('SocketAuthGuard', () => {
     mockDb.where.mockResolvedValue([{ id: 'user-1', username: 'test', email: 'test@test.com', status: 'online' }]);
 
     expect(await guard.canActivate(mockContext)).toBe(true);
-    expect(mockJwt.verifyAsync).toHaveBeenCalledWith('header-only-token');
+    expect(mockJwt.verifyAsync).toHaveBeenCalledWith('header-only-token', { algorithms: ['HS256'] });
   });
 
   it('rejects expired token', async () => {
@@ -84,7 +84,7 @@ describe('SocketAuthGuard', () => {
     mockDb.where.mockResolvedValue([{ id: 'user-1', username: 'test', email: 't@t.com', status: 'online' }]);
 
     await guard.canActivate(mockContext);
-    expect(mockJwt.verifyAsync).toHaveBeenCalledWith('auth-token');
+    expect(mockJwt.verifyAsync).toHaveBeenCalledWith('auth-token', { algorithms: ['HS256'] });
   });
 
   it('sets user on client.data', async () => {
@@ -95,5 +95,18 @@ describe('SocketAuthGuard', () => {
 
     await guard.canActivate(mockContext);
     expect(mockClient.data.user).toEqual(user);
+  });
+
+  it('passes an already-authenticated socket without re-verifying', async () => {
+    mockClient.data = { user: { id: 'user-1', username: 'test', status: 'online' }, tokenExp: Date.now() / 1000 + 60 };
+    expect(await guard.canActivate(mockContext)).toBe(true);
+    expect(mockJwt.verifyAsync).not.toHaveBeenCalled();
+  });
+
+  it('disconnects an authenticated socket whose token expired', async () => {
+    mockClient.data = { user: { id: 'user-1', username: 'test', status: 'online' }, tokenExp: Date.now() / 1000 - 1 };
+    expect(await guard.canActivate(mockContext)).toBe(false);
+    expect(mockClient.emit).toHaveBeenCalledWith('error', expect.objectContaining({ code: 'TOKEN_EXPIRED' }));
+    expect(mockClient.disconnect).toHaveBeenCalledWith(true);
   });
 });

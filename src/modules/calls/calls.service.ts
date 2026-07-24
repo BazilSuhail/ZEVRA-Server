@@ -2,12 +2,16 @@ import { Injectable, Logger, Inject } from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { RedisService } from '../../redis/redis.service';
-import { RedisSessionService } from '../../redis/redis-session.service';
 import { callLogs, callParticipants, users } from '../../database/schema';
-import { eq, and, sql, desc, asc } from 'drizzle-orm';
+import { eq, inArray, sql } from 'drizzle-orm';
 import { randomUUID } from 'crypto';
 
-const CALL_TTL = 300; // 5 minutes max call duration in Redis
+/** Ringing calls expire quickly; connected calls are kept for up to 4 hours. */
+const RINGING_TTL_SECONDS = 120;
+const CONNECTED_TTL_SECONDS = 4 * 60 * 60;
+
+const roomKey = (callId: string) => `zevra:call:room:${callId}`;
+const userCallKey = (userId: string) => `zevra:call:user:${userId}`;
 
 export interface ActiveCall {
   callId: string;
@@ -15,6 +19,19 @@ export interface ActiveCall {
   targetId: string;
   status: string; // 'ringing' | 'connected'
   startedAt: number;
+  callLogId: string | null;
+}
+
+function toActiveCall(callId: string, data: Record<string, string> | null | undefined): ActiveCall | null {
+  if (!data || !data.initiatorId) return null;
+  return {
+    callId,
+    initiatorId: data.initiatorId,
+    targetId: data.targetId,
+    status: data.status,
+    startedAt: Number(data.startedAt),
+    callLogId: data.callLogId || null,
+  };
 }
 
 @Injectable()
@@ -24,7 +41,6 @@ export class CallsService {
   constructor(
     @Inject(DB) private db: NodePgDatabase,
     private redisService: RedisService,
-    private sessionService: RedisSessionService,
   ) {}
 
   private get redis() {
@@ -36,83 +52,86 @@ export class CallsService {
   async getActiveCall(userId: string): Promise<ActiveCall | null> {
     if (!this.redis) return null;
     try {
-      const callId = await this.redis.get(`call:${userId}`);
+      const callId = await this.redis.get(userCallKey(userId));
       if (!callId) return null;
-      const data = await this.redis.hGetAll(`call:room:${callId}`);
-      if (!data || !data.initiatorId) return null;
-      return {
-        callId,
-        initiatorId: data.initiatorId,
-        targetId: data.targetId,
-        status: data.status,
-        startedAt: Number(data.startedAt),
-      };
-    } catch {
+      const data = await this.redis.hGetAll(roomKey(callId));
+      return toActiveCall(callId, data as Record<string, string>);
+    } catch (err) {
+      this.logger.warn(`getActiveCall failed: ${(err as Error).message}`);
       return null;
     }
   }
 
-  async createCall(
-    initiatorId: string,
-    targetId: string,
-  ): Promise<ActiveCall> {
+  async createCall(initiatorId: string, targetId: string, callLogId: string | null = null): Promise<ActiveCall> {
     const callId = randomUUID();
     const now = Date.now();
 
     if (this.redis) {
       const pipeline = this.redis.multi();
-      pipeline.hSet(`call:room:${callId}`, {
+      pipeline.hSet(roomKey(callId), {
         initiatorId,
         targetId,
         status: 'ringing',
         startedAt: String(now),
+        callLogId: callLogId ?? '',
       });
-      pipeline.expire(`call:room:${callId}`, CALL_TTL);
-      pipeline.setEx(`call:${initiatorId}`, CALL_TTL, callId);
-      pipeline.setEx(`call:${targetId}`, CALL_TTL, callId);
+      pipeline.expire(roomKey(callId), RINGING_TTL_SECONDS);
+      pipeline.setEx(userCallKey(initiatorId), RINGING_TTL_SECONDS, callId);
+      pipeline.setEx(userCallKey(targetId), RINGING_TTL_SECONDS, callId);
       await pipeline.exec();
     }
 
-    return { callId, initiatorId, targetId, status: 'ringing', startedAt: now };
+    return { callId, initiatorId, targetId, status: 'ringing', startedAt: now, callLogId };
   }
 
-  async acceptCall(callId: string): Promise<void> {
+  /** Marks the call connected, restarts its clock and extends the state TTL. */
+  async acceptCall(call: ActiveCall): Promise<void> {
     if (!this.redis) return;
     try {
-      await this.redis.hSet(`call:room:${callId}`, { status: 'connected' });
-    } catch {}
+      const pipeline = this.redis.multi();
+      pipeline.hSet(roomKey(call.callId), { status: 'connected', startedAt: String(Date.now()) });
+      pipeline.expire(roomKey(call.callId), CONNECTED_TTL_SECONDS);
+      pipeline.expire(userCallKey(call.initiatorId), CONNECTED_TTL_SECONDS);
+      pipeline.expire(userCallKey(call.targetId), CONNECTED_TTL_SECONDS);
+      await pipeline.exec();
+    } catch (err) {
+      this.logger.warn(`acceptCall failed: ${(err as Error).message}`);
+    }
   }
 
   async cleanupCall(callId: string): Promise<ActiveCall | null> {
     if (!this.redis) return null;
     try {
-      const data = await this.redis.hGetAll(`call:room:${callId}`);
+      const data = await this.redis.hGetAll(roomKey(callId));
       const pipeline = this.redis.multi();
-      pipeline.del(`call:room:${callId}`);
-      if (data?.initiatorId) pipeline.del(`call:${data.initiatorId}`);
-      if (data?.targetId) pipeline.del(`call:${data.targetId}`);
+      pipeline.del(roomKey(callId));
+      if (data?.initiatorId) pipeline.del(userCallKey(data.initiatorId));
+      if (data?.targetId) pipeline.del(userCallKey(data.targetId));
       await pipeline.exec();
-      return data?.initiatorId
-        ? {
-            callId,
-            initiatorId: data.initiatorId,
-            targetId: data.targetId,
-            status: data.status,
-            startedAt: Number(data.startedAt),
-          }
-        : null;
-    } catch {
+      return toActiveCall(callId, data as Record<string, string>);
+    } catch (err) {
+      this.logger.warn(`cleanupCall failed: ${(err as Error).message}`);
       return null;
     }
   }
 
   async cleanupUserCall(userId: string): Promise<ActiveCall | null> {
-    const callId = await this.redis?.get(`call:${userId}`);
+    const callId = await this.redis?.get(userCallKey(userId));
     if (!callId) return null;
     return this.cleanupCall(callId);
   }
 
   // ─── DB Writes ─────────────────────────────────────────────────────────
+
+  async getUsernames(userIds: string[]): Promise<Map<string, string>> {
+    const ids = Array.from(new Set(userIds.filter(Boolean)));
+    if (ids.length === 0) return new Map();
+    const rows = await this.db
+      .select({ id: users.id, username: users.username })
+      .from(users)
+      .where(inArray(users.id, ids));
+    return new Map(rows.map((r) => [r.id, r.username]));
+  }
 
   async createCallLog(
     callType: 'WEBRTC' | 'LIVEKIT',
@@ -150,40 +169,30 @@ export class CallsService {
       .where(eq(callLogs.id, callLogId));
   }
 
-  async endCallLog(
-    callLogId: string,
-    callerId: string,
-    callerUsername: string,
-    calleeId: string,
-    calleeUsername: string,
-    startedAt: Date,
-  ): Promise<void> {
+  /** Closes a connected 1:1 call log and records both participants. */
+  async endCallLog(callLogId: string, callerId: string, calleeId: string, startedAt: Date): Promise<void> {
     const now = new Date();
-    const duration = Math.floor((now.getTime() - startedAt.getTime()) / 1000);
+    const duration = Math.max(0, Math.floor((now.getTime() - startedAt.getTime()) / 1000));
+    const names = await this.getUsernames([callerId, calleeId]);
 
     await this.db
       .update(callLogs)
-      .set({ endedAt: now, duration })
+      .set({ endedAt: now, duration, status: 'completed' })
       .where(eq(callLogs.id, callLogId));
 
-    await this.db.insert(callParticipants).values([
-      {
-        callLogId,
-        userId: callerId,
-        username: callerUsername,
-        joinedAt: startedAt,
-        leftAt: now,
-        duration,
-      },
-      {
-        callLogId,
-        userId: calleeId,
-        username: calleeUsername,
-        joinedAt: startedAt,
-        leftAt: now,
-        duration,
-      },
-    ]);
+    await this.db
+      .insert(callParticipants)
+      .values(
+        [callerId, calleeId].map((userId) => ({
+          callLogId,
+          userId,
+          username: names.get(userId) ?? '',
+          joinedAt: startedAt,
+          leftAt: now,
+          duration,
+        })),
+      )
+      .onConflictDoNothing();
   }
 
   // ─── Call History (one query) ──────────────────────────────────────────

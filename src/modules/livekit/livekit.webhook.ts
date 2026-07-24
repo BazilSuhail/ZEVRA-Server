@@ -1,9 +1,10 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { callLogs, callParticipants, users } from '../../database/schema';
+import { callLogs, callParticipants } from '../../database/schema';
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
-import { randomUUID } from 'crypto';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class LivekitWebhookService {
@@ -11,10 +12,20 @@ export class LivekitWebhookService {
 
   constructor(@Inject(DB) private db: NodePgDatabase) {}
 
+  private async latestLogId(roomName: string): Promise<string | null> {
+    const [log] = await this.db
+      .select({ id: callLogs.id })
+      .from(callLogs)
+      .where(eq(callLogs.roomName, roomName))
+      .orderBy(desc(callLogs.startedAt))
+      .limit(1);
+    return log?.id ?? null;
+  }
+
   async handleRoomStarted(roomName: string): Promise<string | null> {
     try {
-      // Reuse the log created at call initiation (still open) — otherwise
-      // we'd end up with a duplicate row per room session
+      // Reuse the log created at call initiation (still open) to avoid a
+      // duplicate row per room session.
       const [existing] = await this.db
         .select({ id: callLogs.id })
         .from(callLogs)
@@ -25,11 +36,7 @@ export class LivekitWebhookService {
 
       const [row] = await this.db
         .insert(callLogs)
-        .values({
-          type: 'LIVEKIT',
-          roomName,
-          status: 'missed',
-        })
+        .values({ type: 'LIVEKIT', roomName, status: 'missed' })
         .returning({ id: callLogs.id });
       return row.id;
     } catch (err) {
@@ -38,32 +45,26 @@ export class LivekitWebhookService {
     }
   }
 
-  async handleRoomFinished(roomName: string, duration: number): Promise<void> {
+  async handleRoomFinished(roomName: string): Promise<void> {
     try {
-      // Close the most recent open log for this room (rooms are recreated
-      // per session, so only the open one should be touched)
       const updated = await this.db
         .update(callLogs)
         .set({
           endedAt: new Date(),
-          duration,
+          duration: sql<number>`GREATEST(0, EXTRACT(EPOCH FROM (now() - ${callLogs.startedAt})))::int`,
           status: 'completed',
         })
         .where(and(eq(callLogs.roomName, roomName), isNull(callLogs.endedAt)))
         .returning({ id: callLogs.id });
 
       if (updated.length === 0) {
-        // No open log (e.g. initiation log was never created) — add one
-        await this.db
-          .insert(callLogs)
-          .values({
-            type: 'LIVEKIT',
-            roomName,
-            endedAt: new Date(),
-            duration,
-            status: 'completed',
-          })
-          .returning({ id: callLogs.id });
+        await this.db.insert(callLogs).values({
+          type: 'LIVEKIT',
+          roomName,
+          endedAt: new Date(),
+          duration: 0,
+          status: 'completed',
+        });
       }
     } catch (err) {
       this.logger.error(`Failed to update call log on room_finished: ${(err as Error).message}`);
@@ -71,37 +72,23 @@ export class LivekitWebhookService {
   }
 
   async handleParticipantJoined(roomName: string, identity: string, name: string): Promise<void> {
+    if (!UUID_RE.test(identity)) return;
     try {
-      // Find the call log for this room
-      const [log] = await this.db
-        .select({ id: callLogs.id })
-        .from(callLogs)
-        .where(eq(callLogs.roomName, roomName))
-        .orderBy(desc(callLogs.startedAt))
-        .limit(1);
+      const logId = await this.latestLogId(roomName);
+      if (!logId) return;
 
-      if (!log) return;
-
-      // Rejoin after a leave: reset the row so duration counts from this join
+      // Rejoin after a leave: reset the row so duration counts from this join.
       const [reset] = await this.db
         .update(callParticipants)
         .set({ joinedAt: new Date(), leftAt: null, duration: null })
-        .where(
-          and(
-            eq(callParticipants.callLogId, log.id),
-            eq(callParticipants.userId, identity),
-          ),
-        )
+        .where(and(eq(callParticipants.callLogId, logId), eq(callParticipants.userId, identity)))
         .returning({ id: callParticipants.id });
 
       if (!reset) {
         await this.db
           .insert(callParticipants)
-          .values({
-            callLogId: log.id,
-            userId: identity,
-            username: name,
-          });
+          .values({ callLogId: logId, userId: identity, username: name.slice(0, 32) })
+          .onConflictDoNothing();
       }
     } catch (err) {
       this.logger.error(`Failed to add participant: ${(err as Error).message}`);
@@ -109,34 +96,25 @@ export class LivekitWebhookService {
   }
 
   async handleParticipantLeft(roomName: string, identity: string): Promise<void> {
+    if (!UUID_RE.test(identity)) return;
     try {
-      const [log] = await this.db
-        .select({ id: callLogs.id })
-        .from(callLogs)
-        .where(eq(callLogs.roomName, roomName))
-        .limit(1);
-
-      if (!log) return;
+      const logId = await this.latestLogId(roomName);
+      if (!logId) return;
 
       const [participant] = await this.db
-        .select({ id: callLogs.id, joinedAt: callParticipants.joinedAt })
+        .select({ id: callParticipants.id, joinedAt: callParticipants.joinedAt })
         .from(callParticipants)
-        .where(
-          sql`${callParticipants.callLogId} = ${log.id} AND ${callParticipants.userId} = ${identity}`
-        )
+        .where(and(eq(callParticipants.callLogId, logId), eq(callParticipants.userId, identity)))
         .limit(1);
-
       if (!participant) return;
 
       const now = new Date();
-      const duration = Math.floor((now.getTime() - participant.joinedAt.getTime()) / 1000);
+      const duration = Math.max(0, Math.floor((now.getTime() - participant.joinedAt.getTime()) / 1000));
 
       await this.db
         .update(callParticipants)
         .set({ leftAt: now, duration })
-        .where(
-          sql`${callParticipants.callLogId} = ${log.id} AND ${callParticipants.userId} = ${identity}`
-        );
+        .where(eq(callParticipants.id, participant.id));
     } catch (err) {
       this.logger.error(`Failed to update participant: ${(err as Error).message}`);
     }

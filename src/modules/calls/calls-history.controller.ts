@@ -1,6 +1,7 @@
-import { Controller, Get, Param, Query, UseGuards, Request } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Query, UseGuards, Request } from '@nestjs/common';
 import { JwtAuthGuard } from '../../shared/guards/jwt-auth.guard';
 import { CallsService } from './calls.service';
+import { CallHistoryQueryDto, CallHistoryWithUserQueryDto } from './dto/calls-history-query.dto';
 
 @Controller('calls')
 @UseGuards(JwtAuthGuard)
@@ -8,41 +9,23 @@ export class CallsHistoryController {
   constructor(private callsService: CallsService) {}
 
   @Get('history')
-  async getHistory(
-    @Request() req: { user: { id: string } },
-    @Query('page') page?: string,
-    @Query('limit') limit?: string,
-  ) {
-    const userId = req.user.id;
-    const pageNum = Math.max(1, Number(page) || 1);
-    const limitNum = Math.min(50, Math.max(1, Number(limit) || 20));
-    const offset = (pageNum - 1) * limitNum;
-
-    const calls = await this.callsService.getCallHistory(userId, limitNum, offset);
-    const hasMore = calls.length === limitNum;
-
+  async getHistory(@Request() req: { user: { id: string } }, @Query() query: CallHistoryQueryDto) {
+    const offset = (query.page - 1) * query.limit;
+    const calls = await this.callsService.getCallHistory(req.user.id, query.limit, offset);
     return {
       calls,
-      page: pageNum,
-      hasMore,
+      page: query.page,
+      hasMore: calls.length === query.limit,
     };
   }
 
   @Get('history/:userId')
   async getHistoryWithUser(
     @Request() req: { user: { id: string } },
-    @Param('userId') otherUserId: string,
-    @Query('limit') limit?: string,
+    @Param('userId', new ParseUUIDPipe()) otherUserId: string,
+    @Query() query: CallHistoryWithUserQueryDto,
   ) {
-    const userId = req.user.id;
-    const limitNum = Math.min(50, Math.max(1, Number(limit) || 20));
-
-    const calls = await this.callsService.getCallHistoryWithUser(
-      userId,
-      otherUserId,
-      limitNum,
-    );
-
+    const calls = await this.callsService.getCallHistoryWithUser(req.user.id, otherUserId, query.limit);
     return { calls };
   }
 }

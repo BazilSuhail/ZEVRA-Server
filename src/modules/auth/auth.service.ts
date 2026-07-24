@@ -14,7 +14,16 @@ import { CryptoService } from '../../shared/crypto/crypto.service';
 import { SrpService } from './srp.service';
 import { SrpStateService } from './srp-state.service';
 import { RedisSessionService } from '../../redis/redis-session.service';
+import { getAccessTokenTtl } from '../../common/config';
 import * as crypto from 'node:crypto';
+
+const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const INVALID_CREDENTIALS = 'Invalid username or password';
+const INVALID_REFRESH = 'Invalid or expired refresh token';
+
+export function hashRefreshToken(token: string): string {
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+}
 
 @Injectable()
 export class AuthService {
@@ -68,7 +77,7 @@ export class AuthService {
     const ed25519 = this.crypto.generateEd25519KeyPair();
     const sealedEd25519 = this.crypto.sealPrivateKey(ed25519.privateKey, kekSign);
 
-    // 4. Insert user
+    // 4. Insert user (a concurrent duplicate surfaces as a 23505 → 409)
     const [user] = await this.db
       .insert(users)
       .values({
@@ -94,28 +103,49 @@ export class AuthService {
 
     await this.audit('REGISTER', user.id);
 
-    this.logger.log(`User registered: ${user.username}`);
+    this.logger.log(`User registered: ${user.id}`);
     return { user };
   }
 
   // ─── SRP Login Start ─────────────────────────────────────────────────────
 
+  /**
+   * Unknown or inactive usernames get a deterministic decoy salt and a fresh
+   * B computed from a decoy verifier, so the response is indistinguishable
+   * from a real account. login/finish then fails with the generic error.
+   */
   async loginStart(username: string) {
     const [user] = await this.db
-      .select()
+      .select({
+        id: users.id,
+        username: users.username,
+        srpSalt: users.srpSalt,
+        srpVerifier: users.srpVerifier,
+        isActive: users.isActive,
+      })
       .from(users)
       .where(eq(users.username, username));
-    if (!user) throw new UnauthorizedException('User not found');
 
-    const v = BigInt('0x' + user.srpVerifier);
-    const { B, b } = this.srp.generateServerEphemeral(v);
+    let srpSalt: string;
+    let verifier: bigint;
+    let userId: string | null;
+    if (user && user.isActive) {
+      srpSalt = user.srpSalt;
+      verifier = BigInt('0x' + user.srpVerifier);
+      userId = user.id;
+    } else {
+      const decoy = this.srp.decoyCredentials(username, process.env.JWT_SECRET ?? '');
+      srpSalt = decoy.srpSalt;
+      verifier = decoy.verifier;
+      userId = null;
+    }
 
-    this.srpState.set(user.id, { b, B });
+    const { B, b } = this.srp.generateServerEphemeral(verifier);
+    await this.srpState.set(username, { b, B, userId });
 
     return {
-      userId: user.id,
-      username: user.username,
-      srpSalt: user.srpSalt,
+      username,
+      srpSalt,
       B: bigintToHex(B),
     };
   }
@@ -128,35 +158,48 @@ export class AuthService {
     M1: string;
     ip?: string;
   }) {
-    const [user] = await this.db
-      .select()
-      .from(users)
-      .where(eq(users.username, params.username));
-    if (!user) throw new UnauthorizedException('User not found');
-
-    const state = this.srpState.get(user.id);
+    const state = await this.srpState.consume(params.username);
     if (!state) {
-      throw new UnauthorizedException('Session expired. Please start login again.');
+      throw new UnauthorizedException('Login session expired. Please try again.');
     }
 
-    const A = BigInt('0x' + params.A);
-    const v = BigInt('0x' + user.srpVerifier);
+    const A = this.srp.parseClientEphemeral(params.A);
+    if (A === null) {
+      throw new UnauthorizedException(INVALID_CREDENTIALS);
+    }
+
+    const [user] = state.userId
+      ? await this.db.select().from(users).where(eq(users.id, state.userId))
+      : [];
+
+    if (!user || !user.isActive || user.username !== params.username) {
+      // Spend comparable work on the decoy path to avoid a timing oracle.
+      const decoy = this.srp.decoyCredentials(params.username, process.env.JWT_SECRET ?? '');
+      this.srp.verifyClientProof({
+        A,
+        M1: params.M1,
+        b: state.b,
+        B: state.B,
+        v: decoy.verifier,
+        srpSalt: decoy.srpSalt,
+        username: params.username,
+      });
+      throw new UnauthorizedException(INVALID_CREDENTIALS);
+    }
 
     const result = this.srp.verifyClientProof({
       A,
       M1: params.M1,
       b: state.b,
       B: state.B,
-      v,
+      v: BigInt('0x' + user.srpVerifier),
       srpSalt: user.srpSalt,
       username: user.username,
     });
 
-    this.srpState.delete(user.id);
-
     if (!result.valid) {
       await this.audit('LOGIN_FAILED', user.id, { reason: 'Invalid SRP proof' }, params.ip);
-      throw new UnauthorizedException('Invalid credentials');
+      throw new UnauthorizedException(INVALID_CREDENTIALS);
     }
 
     const tokens = await this.issueTokens(user.id);
@@ -166,7 +209,6 @@ export class AuthService {
       .set({ lastLoginAt: new Date(), status: 'ONLINE' })
       .where(eq(users.id, user.id));
 
-    // Set presence in Redis
     await this.sessionService.setOnline(user.id);
 
     const keys = {
@@ -182,7 +224,7 @@ export class AuthService {
 
     await this.audit('LOGIN', user.id, undefined, params.ip);
 
-    this.logger.log(`User logged in: ${user.username}`);
+    this.logger.log(`User logged in: ${user.id}`);
     return {
       user: { id: user.id, username: user.username, email: user.email },
       ...tokens,
@@ -194,33 +236,49 @@ export class AuthService {
   // ─── Token Management ────────────────────────────────────────────────────
 
   async issueTokens(userId: string) {
-    const payload = { sub: userId };
-    const accessToken = await this.jwt.signAsync(payload);
+    const expiresIn = getAccessTokenTtl();
+    const accessToken = await this.jwt.signAsync({ sub: userId }, { expiresIn });
     const refreshToken = this.crypto.randomHex(32);
+    const now = Date.now();
 
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 7);
+    // Opportunistically prune this user's expired refresh tokens.
+    await this.db
+      .delete(refreshTokens)
+      .where(and(eq(refreshTokens.userId, userId), lt(refreshTokens.expiresAt, new Date(now))));
 
     await this.db.insert(refreshTokens).values({
-      token: refreshToken,
+      tokenHash: hashRefreshToken(refreshToken),
       userId,
-      expiresAt,
+      expiresAt: new Date(now + REFRESH_TOKEN_TTL_MS),
     });
 
-    return { accessToken, refreshToken };
+    return { accessToken, refreshToken, expiresIn };
   }
 
+  /**
+   * Rotates a refresh token. The old token is deleted in the same statement
+   * that looks it up, so a token can be redeemed at most once even under
+   * concurrent requests.
+   */
   async refreshTokens(refreshToken: string) {
     const [record] = await this.db
-      .select()
-      .from(refreshTokens)
-      .where(eq(refreshTokens.token, refreshToken));
+      .delete(refreshTokens)
+      .where(eq(refreshTokens.tokenHash, hashRefreshToken(refreshToken)))
+      .returning({ userId: refreshTokens.userId, expiresAt: refreshTokens.expiresAt });
 
     if (!record || record.expiresAt < new Date()) {
-      throw new UnauthorizedException('Invalid or expired refresh token');
+      throw new UnauthorizedException(INVALID_REFRESH);
     }
 
-    await this.db.delete(refreshTokens).where(eq(refreshTokens.id, record.id));
+    const [user] = await this.db
+      .select({ isActive: users.isActive })
+      .from(users)
+      .where(eq(users.id, record.userId));
+    if (!user || !user.isActive) {
+      await this.db.delete(refreshTokens).where(eq(refreshTokens.userId, record.userId));
+      throw new UnauthorizedException(INVALID_REFRESH);
+    }
+
     return this.issueTokens(record.userId);
   }
 
@@ -239,6 +297,7 @@ export class AuthService {
       })
       .from(users)
       .where(eq(users.id, userId));
+    if (!user) throw new UnauthorizedException('Authentication required');
     return user;
   }
 
@@ -256,14 +315,14 @@ export class AuthService {
   private async audit(
     action: string,
     userId?: string,
-    details?: object,
+    details?: Record<string, unknown>,
     ip?: string,
   ) {
     try {
       await this.db.insert(auditLog).values({
         action,
         userId: userId ?? null,
-        details: (details as any) ?? null,
+        details: details ?? null,
         ipAddress: ip ?? null,
       });
     } catch (err) {

@@ -10,7 +10,11 @@
     "start": "bun dist/main.js",
     "start:dev": "bun --watch src/main.ts",
     "start:debug": "bunx --bun tsx watch src/main.ts",
-    "start:prod": "bun dist/main.js"
+    "start:prod": "bun dist/main.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "jest",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@nestjs/bullmq": "^11.0.5",
@@ -44,7 +48,6 @@
     "@swc/core": "^1.16.1",
     "@swc/jest": "^0.2.39",
     "@types/bun": "^1.4.0",
-    "@types/helmet": "^4.0.0",
     "@types/jest": "^30.0.0",
     "@types/multer": "^2.2.0",
     "@types/node": "^26.4.1",

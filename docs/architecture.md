@@ -1,3 +1,5 @@
+> **Note:** This document predates the November 2026 fix pass. [API.md](../API.md) is authoritative wherever the two differ (ports, endpoints, socket events, rate limits, Redis keys, sessions, env vars, migrations).
+
 # Architecture
 
 ZEVRA (Zero-knowledge Events Verified Realtime Architecture) is an end-to-end encrypted messaging server. The server never sees plaintext messages, passwords, or private keys.

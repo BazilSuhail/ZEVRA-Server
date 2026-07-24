@@ -1,299 +1,164 @@
-import {
-  WebSocketGateway,
-  SubscribeMessage,
-  ConnectedSocket,
-  MessageBody,
-  OnGatewayInit,
-} from '@nestjs/websockets';
-import { Logger, UseGuards } from '@nestjs/common';
+import { WebSocketGateway, SubscribeMessage, ConnectedSocket, MessageBody } from '@nestjs/websockets';
+import { UseGuards } from '@nestjs/common';
 import { Socket } from 'socket.io';
 import { SocketAuthGuard, SocketUser } from '../socket/socket-auth.guard';
-import { SocketService } from '../socket/socket.service';
+import { validatePayload } from '../socket/validate-payload';
 import { ChatService } from './chat.service';
+import { MessagesService } from '../modules/messages/messages.service';
 import { ReactionsService } from '../modules/reactions/reactions.service';
-import { RedisPubSubService } from '../redis/redis-pubsub.service';
-import { RateLimitService } from '../shared/rate-limit/rate-limit.service';
+import { ChannelsService } from '../modules/channels/channels.service';
+import { RateLimitConfig, RateLimitService } from '../shared/rate-limit/rate-limit.service';
+import { SendMessageDto, MAX_ENCRYPTED_CONTENT_BYTES } from '../modules/messages/dto/send-message.dto';
+import { GetMessagesSocketDto } from '../modules/messages/dto/get-messages-query.dto';
+import { MarkReadSocketDto } from '../modules/channels/dto/mark-read.dto';
+import { ReactionDto } from '../modules/reactions/dto/add-reaction.dto';
+import { SocketError, toSocketError } from '../common/errors/socket-error';
+import { getCorsOrigins } from '../common/config';
 
-const MAX_MESSAGE_SIZE = 10 * 1024; // 10KB
-
-@WebSocketGateway({ cors: true })
-export class ChatGateway implements OnGatewayInit {
-  private readonly logger = new Logger(ChatGateway.name);
-
+@WebSocketGateway({ cors: { origin: getCorsOrigins(), credentials: true } })
+@UseGuards(SocketAuthGuard)
+export class ChatGateway {
   constructor(
     private chatService: ChatService,
-    private socketService: SocketService,
+    private messagesService: MessagesService,
     private reactionsService: ReactionsService,
-    private pubSubService: RedisPubSubService,
+    private channelsService: ChannelsService,
     private rateLimitService: RateLimitService,
   ) {}
 
-  afterInit() {
-    this.subscribeToGroupChannels();
+  private async limit(key: string, config: RateLimitConfig, message = 'Too many requests') {
+    const rl = await this.rateLimitService.checkRateLimit(key, config);
+    if (!rl.allowed) throw new SocketError('RATE_LIMITED', message);
   }
 
   // ─── Send Message ──────────────────────────────────────────────────────
 
-  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('send-message')
-  async handleSendMessage(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: {
-      channelId: string;
-      encryptedContent: string;
-      contentIv: string;
-      contentTag: string;
-      signature: string;
-      sequenceNumber: number;
-      senderKeyEpoch: number;
-      messageType?: string;
-      metadata?: Record<string, unknown>;
-    },
-  ) {
+  async handleSendMessage(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
-    // Rate limit
-    const rl = await this.rateLimitService.checkRateLimit(
-      `send:${user.id}`,
-      RateLimitService.SEND_MESSAGE,
-    );
-    if (!rl.allowed) {
-      return { success: false, error: 'RATE_LIMITED', message: 'Too many messages' };
-    }
-
-    // Message size validation
-    const contentSize = Buffer.byteLength(data.encryptedContent, 'utf-8');
-    if (contentSize > MAX_MESSAGE_SIZE) {
-      return { success: false, error: 'PAYLOAD_TOO_LARGE', message: 'Message exceeds 10KB limit' };
-    }
-
     try {
-      const msg = await this.chatService.sendMessage({
-        userId: user.id,
-        ...data,
-      });
+      await this.limit(`send:${user.id}`, RateLimitService.SEND_MESSAGE, 'Too many messages');
 
-      // Broadcast to channel room (same mechanism as typing — works via Redis adapter)
-      client.to(`channel:${msg.channelId}`).emit('message:new', {
-        messageId: msg.id,
-        channelId: msg.channelId,
-        senderId: msg.senderId,
-        encryptedContent: msg.encryptedContent,
-        contentIv: msg.contentIv,
-        contentTag: msg.contentTag,
-        sequenceNumber: msg.sequenceNumber,
-        senderKeyEpoch: msg.senderKeyEpoch,
-        messageType: msg.messageType,
-        metadata: msg.metadata,
-        createdAt: msg.createdAt.toISOString(),
-      });
+      const content = (data as { encryptedContent?: unknown } | null)?.encryptedContent;
+      if (typeof content === 'string' && Buffer.byteLength(content, 'utf-8') > MAX_ENCRYPTED_CONTENT_BYTES) {
+        throw new SocketError('PAYLOAD_TOO_LARGE', 'Message exceeds 10KB limit');
+      }
+      const dto = validatePayload(SendMessageDto, data);
 
-      // Cross-node via PubSub (for nodes not in the Socket.IO room)
-      await this.pubSubService.publishToGroup(msg.channelId, JSON.stringify({
-        event: 'message:new',
-        data: {
-          messageId: msg.id,
-          channelId: msg.channelId,
-          senderId: msg.senderId,
-          encryptedContent: msg.encryptedContent,
-          contentIv: msg.contentIv,
-          contentTag: msg.contentTag,
-          sequenceNumber: msg.sequenceNumber,
-          senderKeyEpoch: msg.senderKeyEpoch,
-          messageType: msg.messageType,
-          metadata: msg.metadata,
-          createdAt: msg.createdAt.toISOString(),
-        },
-      }));
-
-      return { success: true, message: msg };
+      // Same pipeline as REST POST /messages; the sending socket already has it
+      const message = await this.messagesService.send(
+        { userId: user.id, ...dto },
+        { exceptSocketId: client.id },
+      );
+      return { success: true, message };
     } catch (err) {
-      const error = err as any;
-      const code = error?.status === 403 ? 'NOT_MEMBER' : 'SEND_FAILED';
-      return { success: false, error: code, message: error?.message };
+      return toSocketError(err);
     }
   }
 
   // ─── Get Messages ──────────────────────────────────────────────────────
 
-  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('get-messages')
-  async handleGetMessages(
-    @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: {
-      channelId: string;
-      limit?: number;
-      cursor?: number;
-      mode?: 'latest' | 'before' | 'since';
-    },
-  ) {
+  async handleGetMessages(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
-    // Rate limit
-    const rl = await this.rateLimitService.checkRateLimit(
-      `getmsg:${user.id}`,
-      RateLimitService.GET_MESSAGES,
-    );
-    if (!rl.allowed) {
-      return { success: false, error: 'RATE_LIMITED', message: 'Too many requests' };
-    }
-
     try {
-      const result = await this.chatService.getMessages(
-        data.channelId,
+      await this.limit(`getmsg:${user.id}`, RateLimitService.GET_MESSAGES);
+      const dto = validatePayload(GetMessagesSocketDto, data);
+      const page = await this.messagesService.getMessages(
+        dto.channelId,
         user.id,
-        data.limit ?? 50,
-        data.cursor,
-        data.mode,
+        dto.limit ?? 50,
+        dto.cursor,
+        dto.mode,
       );
-      return { success: true, ...result };
+      return { success: true, ...page };
     } catch (err) {
-      return { success: false, error: (err as Error).message };
+      return toSocketError(err);
     }
   }
 
   // ─── Mark as Read ──────────────────────────────────────────────────────
 
-  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('mark-read')
-  async handleMarkRead(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string; messageId: string },
-  ) {
+  async handleMarkRead(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
     try {
-      const result = await this.chatService.markAsRead(user.id, data.channelId, data.messageId);
-      return result;
+      const dto = validatePayload(MarkReadSocketDto, data);
+      return await this.channelsService.markRead(user.id, dto.channelId, dto.messageId);
     } catch (err) {
-      return { success: false, error: (err as Error).message };
+      return toSocketError(err);
     }
   }
 
-  // ─── Get Unread Counts ────────────────────────────────────────────────
+  // ─── Unread / Pending ──────────────────────────────────────────────────
 
-  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('get-unread')
   async handleGetUnread(@ConnectedSocket() client: Socket) {
     const user: SocketUser = client.data.user;
-    const counts = await this.chatService.getUnreadCounts(user.id);
-    return { success: true, counts };
+    try {
+      const counts = await this.chatService.getUnreadCounts(user.id);
+      return { success: true, counts };
+    } catch (err) {
+      return toSocketError(err);
+    }
   }
 
-  // ─── Get Pending Messages ──────────────────────────────────────────────
-
-  @UseGuards(SocketAuthGuard)
+  /**
+   * Offline messages are delivered only when the client asks (its listeners
+   * are attached by then). Each call pops exactly the returned batch;
+   * `hasMore` tells the client to call again.
+   */
   @SubscribeMessage('get-pending')
   async handleGetPending(@ConnectedSocket() client: Socket) {
     const user: SocketUser = client.data.user;
-    const pending = await this.chatService.deliverPendingMessages(user.id);
-    return { success: true, count: pending.length, messages: pending };
+    try {
+      await this.limit(`pending:${user.id}`, RateLimitService.GET_MESSAGES);
+      const { messages, remaining } = await this.chatService.deliverPendingMessages(user.id);
+      return { success: true, count: messages.length, messages, hasMore: remaining > 0 };
+    } catch (err) {
+      return toSocketError(err);
+    }
   }
 
   // ─── Reactions ─────────────────────────────────────────────────────────
 
-  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('reaction:add')
-  async handleReactionAdd(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string; messageId: string; emoji: string },
-  ) {
+  async handleReactionAdd(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
     try {
-      const result = await this.reactionsService.addReaction(
-        user.id,
-        data.channelId,
-        data.messageId,
-        data.emoji,
+      await this.limit(`reaction:${user.id}`, RateLimitService.REACTION);
+      const dto = validatePayload(ReactionDto, data);
+      return await this.reactionsService.addReaction(
+        { id: user.id, username: user.username },
+        dto.channelId,
+        dto.messageId,
+        dto.emoji,
       );
-
-      // One reaction per user: announce displaced emojis FIRST so receivers
-      // swap instead of accumulating
-      for (const replacedEmoji of result.replaced ?? []) {
-        const removedReaction = {
-          userId: user.id,
-          username: user.username,
-          messageId: data.messageId,
-          emoji: replacedEmoji,
-          channelId: data.channelId,
-        };
-        client.to(`channel:${data.channelId}`).emit('reaction:removed', removedReaction);
-        await this.pubSubService.publishToGroup(data.channelId, JSON.stringify({
-          event: 'reaction:removed',
-          data: removedReaction,
-        }));
-      }
-
-      if (result.action === 'added') {
-        // Broadcast to channel room
-        const reaction = {
-          userId: user.id,
-          username: user.username,
-          messageId: data.messageId,
-          emoji: data.emoji,
-          channelId: data.channelId,
-        };
-        client.to(`channel:${data.channelId}`).emit('reaction:added', reaction);
-
-        // Cross-node via PubSub
-        await this.pubSubService.publishToGroup(data.channelId, JSON.stringify({
-          event: 'reaction:added',
-          data: reaction,
-        }));
-      }
-
-      return result;
     } catch (err) {
-      return { success: false, error: (err as Error).message };
+      return toSocketError(err);
     }
   }
 
-  @UseGuards(SocketAuthGuard)
   @SubscribeMessage('reaction:remove')
-  async handleReactionRemove(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string; messageId: string; emoji: string },
-  ) {
+  async handleReactionRemove(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
     const user: SocketUser = client.data.user;
-
     try {
-      const result = await this.reactionsService.removeReaction(
-        user.id,
-        data.channelId,
-        data.messageId,
-        data.emoji,
+      await this.limit(`reaction:${user.id}`, RateLimitService.REACTION);
+      const dto = validatePayload(ReactionDto, data);
+      return await this.reactionsService.removeReaction(
+        { id: user.id, username: user.username },
+        dto.channelId,
+        dto.messageId,
+        dto.emoji,
       );
-
-      if (result.action === 'removed') {
-        const reaction = {
-          userId: user.id,
-          username: user.username,
-          messageId: data.messageId,
-          emoji: data.emoji,
-          channelId: data.channelId,
-        };
-        client.to(`channel:${data.channelId}`).emit('reaction:removed', reaction);
-
-        await this.pubSubService.publishToGroup(data.channelId, JSON.stringify({
-          event: 'reaction:removed',
-          data: reaction,
-        }));
-      }
-
-      return result;
     } catch (err) {
-      return { success: false, error: (err as Error).message };
+      return toSocketError(err);
     }
   }
 
-  // ─── Private: Subscribe to Group Channels ──────────────────────────────
-
-  private subscribeToGroupChannels() {
-    // We use pattern subscription to catch all group channels
-    // In a real multi-node setup, you'd use Redis pattern subscribe
-    // For now, we rely on the Socket.io room broadcast within a single node
-    this.logger.log('Chat gateway initialized — cross-node via Redis PubSub');
+  /** Legacy alias: older clients emit `reaction:removed` to remove a reaction. */
+  @SubscribeMessage('reaction:removed')
+  handleReactionRemoveLegacy(@ConnectedSocket() client: Socket, @MessageBody() data: unknown) {
+    return this.handleReactionRemove(client, data);
   }
 }

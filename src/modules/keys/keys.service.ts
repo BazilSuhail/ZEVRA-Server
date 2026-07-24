@@ -1,19 +1,37 @@
-import { Inject, Injectable, Logger, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { DB } from '../../database/database.module';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { users, senderKeys, memberships } from '../../database/schema';
-import { eq, and, inArray, isNull } from 'drizzle-orm';
-import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
+import { users, senderKeys, memberships, auditLog } from '../../database/schema';
+import { eq, and, inArray, isNull, lt } from 'drizzle-orm';
+
+export interface RotateKeysParams {
+  newPublicKey: string;
+  newEncryptedPrivateKey: string;
+  newKeySalt: string;
+  newPublicKeySign: string;
+  newEncryptedPrivateKeySign: string;
+  newKeySaltSign: string;
+  newKeyVersion: number;
+}
+
+export interface SenderKeyItem {
+  receiverId: string;
+  encryptedKey: string;
+  keySignature: string;
+}
 
 @Injectable()
 export class KeysService {
   private readonly logger = new Logger(KeysService.name);
 
-  constructor(
-    @Inject(DB) private db: NodePgDatabase,
-    @InjectQueue('key-rotation') private keyRotationQueue: Queue,
-  ) {}
+  constructor(@Inject(DB) private db: NodePgDatabase) {}
 
   async getPublicKeys(userIds: string[]) {
     if (userIds.length === 0) return {};
@@ -28,7 +46,6 @@ export class KeysService {
       .from(users)
       .where(inArray(users.id, userIds));
 
-    // Return keyed by userId
     const result: Record<string, { publicKey: string; publicKeySign: string; keyVersion: number }> = {};
     for (const row of rows) {
       result[row.id] = {
@@ -56,47 +73,79 @@ export class KeysService {
       .from(users)
       .where(eq(users.id, userId));
 
+    if (!user) throw new NotFoundException('User not found');
     return user;
   }
 
-  async rotateKeys(userId: string, params: {
-    newPublicKey: string;
-    newEncryptedPrivateKey: string;
-    newKeySalt: string;
-    newPublicKeySign: string;
-    newEncryptedPrivateKeySign: string;
-    newKeySaltSign: string;
-    newKeyVersion: number;
-  }) {
-    // Queue key rotation (background processing)
-    this.keyRotationQueue.add('rotate', {
-      userId,
-      ...params,
-    }).catch((err) => this.logger.warn(`Key rotation queue failed: ${err.message}`));
+  /**
+   * Applies a client-generated key rotation synchronously. The version
+   * check is part of the UPDATE predicate, so concurrent rotations cannot
+   * both succeed or move the version backwards.
+   */
+  async rotateKeys(userId: string, params: RotateKeysParams) {
+    const [updated] = await this.db
+      .update(users)
+      .set({
+        publicKey: params.newPublicKey,
+        encryptedPrivateKey: params.newEncryptedPrivateKey,
+        keySalt: params.newKeySalt,
+        publicKeySign: params.newPublicKeySign,
+        encryptedPrivateKeySign: params.newEncryptedPrivateKeySign,
+        keySaltSign: params.newKeySaltSign,
+        keyVersion: params.newKeyVersion,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(users.id, userId), lt(users.keyVersion, params.newKeyVersion)))
+      .returning({ keyVersion: users.keyVersion });
 
-    return { success: true, message: 'Keys rotation queued' };
+    if (!updated) {
+      const [current] = await this.db
+        .select({ keyVersion: users.keyVersion })
+        .from(users)
+        .where(eq(users.id, userId));
+      if (!current) throw new NotFoundException('User not found');
+      throw new BadRequestException(
+        `newKeyVersion must be greater than the current key version (${current.keyVersion})`,
+      );
+    }
+
+    try {
+      await this.db.insert(auditLog).values({
+        action: 'KEY_ROTATE',
+        userId,
+        details: { newKeyVersion: updated.keyVersion },
+      });
+    } catch (err) {
+      this.logger.warn(`Audit log failed for KEY_ROTATE: ${(err as Error).message}`);
+    }
+
+    return { success: true, keyVersion: updated.keyVersion };
   }
 
-  async uploadSenderKeys(ownerId: string, groupId: string, epoch: number, items: {
-    receiverId: string;
-    encryptedKey: string;
-    keySignature: string;
-  }[]) {
-    // Only members of the group may upload sender keys to it
-    const [membership] = await this.db
-      .select({ id: memberships.id })
+  async uploadSenderKeys(ownerId: string, groupId: string, epoch: number, items: SenderKeyItem[]) {
+    const receiverIds = Array.from(new Set(items.map((i) => i.receiverId)));
+    if (receiverIds.length !== items.length) {
+      throw new BadRequestException('Duplicate receiverId in items');
+    }
+
+    // Owner and every receiver must be active members of the channel.
+    const memberRows = await this.db
+      .select({ userId: memberships.userId })
       .from(memberships)
       .where(
         and(
-          eq(memberships.userId, ownerId),
           eq(memberships.channelId, groupId),
+          inArray(memberships.userId, [ownerId, ...receiverIds]),
           isNull(memberships.leftAt),
         ),
-      )
-      .limit(1);
-
-    if (!membership) {
+      );
+    const members = new Set(memberRows.map((r) => r.userId));
+    if (!members.has(ownerId)) {
       throw new ForbiddenException('Not a member of this group');
+    }
+    const outsiders = receiverIds.filter((id) => !members.has(id));
+    if (outsiders.length > 0) {
+      throw new BadRequestException('All receivers must be members of this group');
     }
 
     const values = items.map((item) => ({
@@ -108,10 +157,9 @@ export class KeysService {
       keySignature: item.keySignature,
     }));
 
-    // Batch insert (upsert: delete ONLY this owner's keys for this epoch,
-    // never other members' keys, then insert)
-    if (values.length > 0) {
-      await this.db
+    // Replace only this owner's keys for this epoch, atomically.
+    await this.db.transaction(async (tx) => {
+      await tx
         .delete(senderKeys)
         .where(
           and(
@@ -120,9 +168,8 @@ export class KeysService {
             eq(senderKeys.ownerId, ownerId),
           ),
         );
-
-      await this.db.insert(senderKeys).values(values);
-    }
+      await tx.insert(senderKeys).values(values);
+    });
 
     return { success: true, message: 'Sender keys uploaded' };
   }
@@ -151,5 +198,4 @@ export class KeysService {
       .where(and(...conditions))
       .orderBy(senderKeys.epoch);
   }
-
 }

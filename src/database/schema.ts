@@ -135,8 +135,9 @@ export const senderKeys = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
   },
   (t) => [
-    uniqueIndex('idx_sender_keys_group_receiver_epoch').on(
+    uniqueIndex('idx_sender_keys_group_owner_receiver_epoch').on(
       t.groupId,
+      t.ownerId,
       t.receiverId,
       t.epoch,
     ),
@@ -190,16 +191,21 @@ export const pendingMessages = pgTable(
 
 // ─── Refresh Tokens ─────────────────────────────────────────────────────────
 
-export const refreshTokens = pgTable('refresh_tokens', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  token: text('token').notNull().unique(),
-  expiresAt: timestamp('expires_at').notNull(),
-  createdAt: timestamp('created_at').notNull().defaultNow(),
+// Only the SHA-256 hex digest of a refresh token is stored.
+export const refreshTokens = pgTable(
+  'refresh_tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tokenHash: varchar('token_hash', { length: 64 }).notNull().unique(),
+    expiresAt: timestamp('expires_at').notNull(),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
 
-  userId: uuid('user_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }),
-});
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+  },
+  (t) => [index('idx_refresh_tokens_user').on(t.userId)],
+);
 
 // ─── Audit Log ──────────────────────────────────────────────────────────────
 
@@ -224,7 +230,7 @@ export const reactions = pgTable(
   'reactions',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    emoji: varchar('emoji', { length: 8 }).notNull(),
+    emoji: varchar('emoji', { length: 32 }).notNull(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
 
     messageId: uuid('message_id')

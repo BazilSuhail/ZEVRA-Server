@@ -1,14 +1,12 @@
 import { Module } from '@nestjs/common';
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
-import { DatabaseModule } from '../../database/database.module';
-import { RedisSessionService } from '../../redis/redis-session.service';
-import { RedisModule } from '../../redis/redis.module';
 
+// DatabaseModule and RedisModule are global; RedisSessionService must come
+// from RedisModule (it receives the connected client there).
 @Module({
-  imports: [DatabaseModule, RedisModule],
   controllers: [UsersController],
-  providers: [UsersService, RedisSessionService],
+  providers: [UsersService],
   exports: [UsersService],
 })
 export class UsersModule {}

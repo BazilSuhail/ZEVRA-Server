@@ -4,21 +4,21 @@ import {
   Body,
   Headers,
   HttpCode,
-  Logger,
   UseGuards,
-  Request,
+  Req,
   ForbiddenException,
+  ServiceUnavailableException,
   UnauthorizedException,
-  BadRequestException,
 } from '@nestjs/common';
+import type { RawBodyRequest } from '@nestjs/common';
+import type { Request } from 'express';
 import { JwtAuthGuard } from '../../shared/guards/jwt-auth.guard';
 import { LivekitService } from './livekit.service';
 import { LivekitWebhookService } from './livekit.webhook';
+import { LivekitTokenDto } from './dto/livekit-token.dto';
 
 @Controller('livekit')
 export class LivekitController {
-  private readonly logger = new Logger(LivekitController.name);
-
   constructor(
     private livekitService: LivekitService,
     private webhookService: LivekitWebhookService,
@@ -27,31 +27,23 @@ export class LivekitController {
   // ─── Token Endpoint ──────────────────────────────────────────────────
 
   @Post('token')
+  @HttpCode(200)
   @UseGuards(JwtAuthGuard)
   async getToken(
-    @Request() req: { user: { id: string; username: string } },
-    @Body() body: { roomName: string; participantName?: string },
+    @Req() req: Request & { user: { id: string; username: string } },
+    @Body() body: LivekitTokenDto,
   ) {
-    const { roomName, participantName } = body;
+    const { roomName } = body;
+    const { id: userId, username } = req.user;
 
-    if (!roomName) {
-      throw new BadRequestException('roomName is required');
-    }
-
-    // Never trust a client-supplied identity — always use the authenticated user
-    const userId = req.user.id;
-    const username = participantName || req.user.username;
-
-    // Only allow joining rooms the authenticated user belongs to
     const authorized = await this.livekitService.authorizeRoomAccess(roomName, userId);
     if (!authorized) {
       throw new ForbiddenException('Not allowed to join this room');
     }
 
     const token = await this.livekitService.generateToken(roomName, userId, username);
-
     if (!token) {
-      throw new UnauthorizedException('LiveKit not configured');
+      throw new ServiceUnavailableException('Calls are not available');
     }
 
     return {
@@ -62,55 +54,42 @@ export class LivekitController {
   }
 
   // ─── Webhook Endpoint ────────────────────────────────────────────────
+  // Signature verification needs the exact bytes LiveKit signed, so the raw
+  // body (enabled in main.ts, incl. application/webhook+json) is used.
 
   @Post('webhook')
   @HttpCode(200)
-  async handleWebhook(
-    @Body() body: string,
-    @Headers('authorization') authHeader: string,
-  ) {
-    const event = await this.livekitService.handleWebhook(body, authHeader);
-
-    if (!event) {
-      this.logger.warn('Invalid webhook event');
-      return {};
+  async handleWebhook(@Req() req: RawBodyRequest<Request>, @Headers('authorization') authHeader?: string) {
+    const raw = req.rawBody;
+    if (!raw || raw.length === 0 || !authHeader) {
+      throw new UnauthorizedException('Invalid webhook');
     }
 
+    const event = await this.livekitService.handleWebhook(raw.toString('utf8'), authHeader);
+    if (!event) {
+      throw new UnauthorizedException('Invalid webhook');
+    }
+
+    const roomName = event.room?.name;
+    const identity = event.participant?.identity;
+
     switch (event.event) {
-      case 'room_started': {
-        const roomName = event.room?.name;
-        if (roomName) {
-          await this.webhookService.handleRoomStarted(roomName);
-        }
+      case 'room_started':
+        if (roomName) await this.webhookService.handleRoomStarted(roomName);
         break;
-      }
-
-      case 'room_finished': {
-        const roomName = event.room?.name;
-        if (roomName) {
-          await this.webhookService.handleRoomFinished(roomName, 0);
-        }
+      case 'room_finished':
+        if (roomName) await this.webhookService.handleRoomFinished(roomName);
         break;
-      }
-
-      case 'participant_joined': {
-        const roomName = event.room?.name;
-        const identity = event.participant?.identity;
-        const name = event.participant?.name;
+      case 'participant_joined':
         if (roomName && identity) {
-          await this.webhookService.handleParticipantJoined(roomName, identity, name || identity);
+          await this.webhookService.handleParticipantJoined(roomName, identity, event.participant?.name || identity);
         }
         break;
-      }
-
-      case 'participant_left': {
-        const roomName = event.room?.name;
-        const identity = event.participant?.identity;
-        if (roomName && identity) {
-          await this.webhookService.handleParticipantLeft(roomName, identity);
-        }
+      case 'participant_left':
+        if (roomName && identity) await this.webhookService.handleParticipantLeft(roomName, identity);
         break;
-      }
+      default:
+        break;
     }
 
     return {};

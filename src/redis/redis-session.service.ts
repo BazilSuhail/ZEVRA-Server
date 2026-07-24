@@ -1,203 +1,190 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { RedisClientType } from 'redis';
+import { RedisService } from './redis.service';
+import { RedisKeys, RedisTtl } from './redis-keys';
 
+/** Stored offline-delivery payload: identical to the `message:new` event payload. */
 export interface PendingMessage {
+  id: string;
   messageId: string;
   channelId: string;
   senderId: string;
+  senderUsername: string | null;
   encryptedContent: string;
   contentIv: string;
   contentTag: string;
+  signature: string;
   sequenceNumber: number;
   senderKeyEpoch: number;
   messageType: string;
-  metadata?: Record<string, unknown> | null;
+  metadata: Record<string, unknown> | null;
+  isDeleted: boolean;
   createdAt: string;
 }
 
 @Injectable()
 export class RedisSessionService {
   private readonly logger = new Logger(RedisSessionService.name);
-  private client: RedisClientType | null = null;
 
-  setClient(client: RedisClientType | null) {
-    this.client = client;
+  constructor(private readonly redis: RedisService) {}
+
+  private get client() {
+    return this.redis.getClient();
   }
 
-  // ─── User Session (1:1 mapping) ────────────────────────────────────────
+  // ─── Socket registry (multiple sockets per user) ──────────────────────
 
-  async registerSession(userId: string, socketId: string): Promise<void> {
-    if (!this.client) return;
+  /** Registers a socket; returns the number of live sockets for the user (or null if unknown). */
+  async addSocket(userId: string, socketId: string): Promise<number | null> {
+    const client = this.client;
+    if (!client) return null;
     try {
-      const pipeline = this.client.multi();
-      pipeline.setEx(`session:${userId}`, 600, socketId);
-      pipeline.setEx(`socket:${socketId}`, 600, userId);
-      await pipeline.exec();
+      const key = RedisKeys.sockets(userId);
+      const now = Date.now();
+      const res = await client
+        .multi()
+        .zRemRangeByScore(key, '-inf', now - RedisTtl.socketStaleMs)
+        .zAdd(key, { score: now, value: socketId })
+        .expire(key, RedisTtl.socketsSeconds)
+        .zCard(key)
+        .exec();
+      return Number(res[3] ?? 0);
     } catch (err) {
-      this.logger.warn(`registerSession failed: ${(err as Error).message}`);
-    }
-  }
-
-  async getSession(userId: string): Promise<string | null> {
-    if (!this.client) return null;
-    try {
-      return await this.client.get(`session:${userId}`);
-    } catch {
+      this.logger.warn(`addSocket failed: ${(err as Error).message}`);
       return null;
     }
   }
 
-  async getAndDeleteSession(userId: string): Promise<string | null> {
-    if (!this.client) return null;
+  /** Heartbeat: refresh this socket's liveness and the key TTL. */
+  async refreshSocket(userId: string, socketId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
     try {
-      return await this.client.getDel(`session:${userId}`);
+      const key = RedisKeys.sockets(userId);
+      await client
+        .multi()
+        .zAdd(key, { score: Date.now(), value: socketId })
+        .expire(key, RedisTtl.socketsSeconds)
+        .exec();
     } catch {
-      return null;
+      // Next heartbeat retries
     }
   }
 
-  async getUserIdBySocket(socketId: string): Promise<string | null> {
-    if (!this.client) return null;
+  /** Unregisters a socket; returns remaining live sockets (or null if unknown). */
+  async removeSocket(userId: string, socketId: string): Promise<number | null> {
+    const client = this.client;
+    if (!client) return null;
     try {
-      return await this.client.get(`socket:${socketId}`);
-    } catch {
+      const key = RedisKeys.sockets(userId);
+      const res = await client
+        .multi()
+        .zRem(key, socketId)
+        .zRemRangeByScore(key, '-inf', Date.now() - RedisTtl.socketStaleMs)
+        .zCard(key)
+        .exec();
+      return Number(res[2] ?? 0);
+    } catch (err) {
+      this.logger.warn(`removeSocket failed: ${(err as Error).message}`);
       return null;
     }
-  }
-
-  async removeSession(userId: string, socketId: string): Promise<void> {
-    if (!this.client) return;
-    try {
-      const pipeline = this.client.multi();
-      pipeline.del(`session:${userId}`);
-      pipeline.del(`socket:${socketId}`);
-      await pipeline.exec();
-    } catch {}
-  }
-
-  async renewSession(userId: string, socketId: string): Promise<void> {
-    if (!this.client) return;
-    try {
-      const pipeline = this.client.multi();
-      pipeline.expire(`session:${userId}`, 600);
-      pipeline.expire(`socket:${socketId}`, 600);
-      await pipeline.exec();
-    } catch {}
   }
 
   // ─── Presence ──────────────────────────────────────────────────────────
 
   async setOnline(userId: string): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client) return;
     try {
-      await this.client.setEx(`presence:${userId}`, 90, 'online');
-    } catch {}
+      await client.setEx(RedisKeys.presence(userId), RedisTtl.presenceSeconds, 'online');
+    } catch {
+      // Presence is refreshed by the next heartbeat
+    }
   }
 
   async setOffline(userId: string): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client) return;
     try {
-      await this.client.del(`presence:${userId}`);
-    } catch {}
+      await client.del(RedisKeys.presence(userId));
+    } catch {
+      // Key expires on its own
+    }
   }
 
   async isOnline(userId: string): Promise<boolean> {
-    if (!this.client) return false;
+    const client = this.client;
+    if (!client) return false;
     try {
-      const val = await this.client.get(`presence:${userId}`);
-      return val === 'online';
+      return (await client.get(RedisKeys.presence(userId))) === 'online';
     } catch {
       return false;
     }
   }
 
   async getOnlineUsers(userIds: string[]): Promise<Set<string>> {
-    if (!this.client || userIds.length === 0) return new Set();
+    const online = new Set<string>();
+    const client = this.client;
+    if (!client || userIds.length === 0) return online;
     try {
-      const keys = userIds.map((id) => `presence:${id}`);
-      const values = await this.client.mGet(keys);
-      const online = new Set<string>();
-      for (let i = 0; i < userIds.length; i++) {
-        if (values[i] === 'online') online.add(userIds[i]);
-      }
-      return online;
+      const values = await client.mGet(userIds.map((id) => RedisKeys.presence(id)));
+      userIds.forEach((id, i) => {
+        if (values[i] === 'online') online.add(id);
+      });
     } catch {
-      return new Set();
+      // Degraded: report nobody online
     }
-  }
-
-  // ─── Channel Members (Redis denormalization) ───────────────────────────
-
-  async addChannelMember(channelId: string, userId: string): Promise<void> {
-    if (!this.client) return;
-    try {
-      await this.client.sAdd(`channel:members:${channelId}`, userId);
-    } catch {}
-  }
-
-  async removeChannelMember(channelId: string, userId: string): Promise<void> {
-    if (!this.client) return;
-    try {
-      await this.client.sRem(`channel:members:${channelId}`, userId);
-    } catch {}
-  }
-
-  async getChannelMembers(channelId: string): Promise<string[]> {
-    if (!this.client) return [];
-    try {
-      return await this.client.sMembers(`channel:members:${channelId}`);
-    } catch {
-      return [];
-    }
-  }
-
-  async isChannelMember(channelId: string, userId: string): Promise<boolean> {
-    if (!this.client) return false;
-    try {
-      return !!(await this.client.sIsMember(`channel:members:${channelId}`, userId));
-    } catch {
-      return false;
-    }
+    return online;
   }
 
   // ─── Pending Messages (offline queue) ──────────────────────────────────
 
-  async addPendingMessage(userId: string, message: PendingMessage): Promise<void> {
-    if (!this.client) return;
+  /** Queues one payload for many users in a single round trip. */
+  async addPendingMessage(userIds: string[], message: PendingMessage): Promise<void> {
+    const client = this.client;
+    if (!client || userIds.length === 0) return;
     try {
-      const key = `pending:${userId}`;
-      const score = message.sequenceNumber;
-      await this.client.zAdd(key, { score, value: JSON.stringify(message) });
-      await this.client.expire(key, 604800);
+      const value = JSON.stringify(message);
+      const score = Date.parse(message.createdAt) || Date.now();
+      const multi = client.multi();
+      for (const userId of userIds) {
+        const key = RedisKeys.pending(userId);
+        multi.zAdd(key, { score, value });
+        multi.expire(key, RedisTtl.pendingSeconds);
+      }
+      await multi.exec();
     } catch (err) {
       this.logger.warn(`addPendingMessage failed: ${(err as Error).message}`);
     }
   }
 
-  async getPendingMessages(userId: string, limit = 100): Promise<PendingMessage[]> {
-    if (!this.client) return [];
+  /**
+   * Returns the oldest `limit` pending messages and removes exactly those
+   * entries (by member), so anything queued concurrently is kept.
+   */
+  async popPendingMessages(
+    userId: string,
+    limit = 100,
+  ): Promise<{ messages: PendingMessage[]; remaining: number }> {
+    const client = this.client;
+    if (!client) return { messages: [], remaining: 0 };
     try {
-      const key = `pending:${userId}`;
-      const items = await this.client.zRangeWithScores(key, 0, limit - 1);
-      return items.map((item) => JSON.parse(item.value));
-    } catch {
-      return [];
-    }
-  }
+      const key = RedisKeys.pending(userId);
+      const raw = (await client.zRange(key, 0, limit - 1)).map(String);
+      if (raw.length === 0) return { messages: [], remaining: 0 };
 
-  async clearPendingMessages(userId: string): Promise<void> {
-    if (!this.client) return;
-    try {
-      await this.client.del(`pending:${userId}`);
-    } catch {}
-  }
-
-  async getPendingCount(userId: string): Promise<number> {
-    if (!this.client) return 0;
-    try {
-      return await this.client.zCard(`pending:${userId}`);
-    } catch {
-      return 0;
+      const res = await client.multi().zRem(key, raw).zCard(key).exec();
+      const messages: PendingMessage[] = [];
+      for (const item of raw) {
+        try {
+          messages.push(JSON.parse(item) as PendingMessage);
+        } catch {
+          // Skip corrupt entries
+        }
+      }
+      return { messages, remaining: Number(res[1] ?? 0) };
+    } catch (err) {
+      this.logger.warn(`popPendingMessages failed: ${(err as Error).message}`);
+      return { messages: [], remaining: 0 };
     }
   }
 }

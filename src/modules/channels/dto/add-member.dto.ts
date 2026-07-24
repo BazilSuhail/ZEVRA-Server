@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsEnum } from 'class-validator';
+import { IsOptional, IsEnum, IsUUID } from 'class-validator';
 
 export enum MemberRole {
   MEMBER = 'MEMBER',
@@ -6,7 +6,7 @@ export enum MemberRole {
 }
 
 export class AddMemberDto {
-  @IsString()
+  @IsUUID()
   userId!: string;
 
   @IsEnum(MemberRole)

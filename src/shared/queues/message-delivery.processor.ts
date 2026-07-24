@@ -1,41 +1,26 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
-import { Inject } from '@nestjs/common';
-import { DB } from '../../database/database.module';
-import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { memberships } from '../../database/schema';
-import { eq } from 'drizzle-orm';
 import { RedisSessionService } from '../../redis/redis-session.service';
 import { RedisCacheService } from '../../redis/redis-cache.service';
+import {
+  MESSAGE_DELIVERY_QUEUE,
+  MessageDeliveryJob,
+  runMessageDelivery,
+} from './message-delivery.job';
 
-const BATCH_SIZE = 100;
+export type { MessageDeliveryJob } from './message-delivery.job';
 
-export interface MessageDeliveryJob {
-  messageId: string;
-  channelId: string;
-  senderId: string;
-  encryptedContent: string;
-  contentIv: string;
-  contentTag: string;
-  sequenceNumber: number;
-  senderKeyEpoch: number;
-  messageType: string;
-  metadata?: Record<string, unknown> | null;
-  createdAt: string;
-}
-
-@Processor('message-delivery', {
-  concurrency: 10,
-  stalledInterval: 30_000,
-  removeOnComplete: { age: 3600 },
-  removeOnFail: { age: 86400 },
-})
+/**
+ * Offline queue + unread counters. Online delivery already happened via the
+ * `channel:{id}` room broadcast; the job carries the recipients that had no
+ * live socket in that room at broadcast time.
+ */
+@Processor(MESSAGE_DELIVERY_QUEUE, { concurrency: 10, stalledInterval: 30_000 })
 export class MessageDeliveryProcessor extends WorkerHost {
   private readonly logger = new Logger(MessageDeliveryProcessor.name);
 
   constructor(
-    @Inject(DB) private db: NodePgDatabase,
     private sessionService: RedisSessionService,
     private cacheService: RedisCacheService,
   ) {
@@ -43,81 +28,22 @@ export class MessageDeliveryProcessor extends WorkerHost {
   }
 
   async process(job: Job<MessageDeliveryJob>) {
-    const {
-      messageId,
-      channelId,
-      senderId,
-      encryptedContent,
-      contentIv,
-      contentTag,
-      sequenceNumber,
-      senderKeyEpoch,
-      messageType,
-      metadata,
-      createdAt,
-    } = job.data;
-
-    const payload = {
-      messageId,
-      channelId,
-      senderId,
-      encryptedContent,
-      contentIv,
-      contentTag,
-      sequenceNumber,
-      senderKeyEpoch,
-      messageType,
-      metadata: metadata ?? null,
-      createdAt,
-    };
-
-    this.logger.debug(`Processing delivery for message ${messageId} in channel ${channelId}`);
-
-    // 1. Get channel members (Redis first, Postgres fallback)
-    let members = await this.sessionService.getChannelMembers(channelId);
-    if (members.length === 0) {
-      const dbMembers = await this.db
-        .select({ userId: memberships.userId })
-        .from(memberships)
-        .where(eq(memberships.channelId, channelId));
-      members = dbMembers.map((m) => m.userId);
-      // Denormalize for next time
-      for (const uid of members) {
-        await this.sessionService.addChannelMember(channelId, uid);
-      }
+    const data = job.data;
+    if (!data?.message || !Array.isArray(data.recipientIds) || !Array.isArray(data.offlineUserIds)) {
+      // Jobs enqueued by an older server version carry a different shape
+      this.logger.warn(`Skipping malformed delivery job ${job.id}`);
+      return { queued: 0, recipients: 0 };
     }
+    return runMessageDelivery(data, this.sessionService, this.cacheService);
+  }
 
-    // 2. Check online status for all members
-    const onlineUsers = await this.sessionService.getOnlineUsers(members);
+  @OnWorkerEvent('failed')
+  onFailed(job: Job<MessageDeliveryJob> | undefined, err: Error) {
+    this.logger.warn(`Delivery job ${job?.id} failed: ${err.message}`);
+  }
 
-    // 3. Handle offline users + unread counts (online delivery is handled by gateway room broadcast)
-    let queued = 0;
-
-    const recipients = members.filter((id) => id !== senderId);
-
-    for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
-      const batch = recipients.slice(i, i + BATCH_SIZE);
-
-      const results = await Promise.allSettled(
-        batch.map(async (memberId) => {
-          if (!onlineUsers.has(memberId)) {
-            // Queue for delivery when user comes online
-            await this.sessionService.addPendingMessage(memberId, payload);
-            queued++;
-          }
-          await this.cacheService.incrementUnread(memberId, channelId);
-        }),
-      );
-
-      this.logger.debug(
-        `Batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} members processed`,
-      );
-    }
-
-    this.logger.debug(
-      `Delivery complete for ${messageId}: ${queued} queued (offline), ${members.length} total members`,
-    );
-
-    return { queued, totalMembers: members.length };
+  @OnWorkerEvent('error')
+  onError(err: Error) {
+    this.logger.error(`Delivery worker error: ${err.message}`);
   }
 }

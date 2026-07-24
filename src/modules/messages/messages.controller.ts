@@ -1,7 +1,18 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { MessagesService } from './messages.service';
 import { SendMessageDto } from './dto/send-message.dto';
+import { GetMessagesQueryDto } from './dto/get-messages-query.dto';
 import { CurrentUser } from '../../common/current-user.decorator';
 
 @Controller('messages')
@@ -9,6 +20,7 @@ import { CurrentUser } from '../../common/current-user.decorator';
 export class MessagesController {
   constructor(private messagesService: MessagesService) {}
 
+  /** Same pipeline as socket `send-message` (broadcast, cache, offline queue, unread). */
   @Post()
   send(@CurrentUser('id') userId: string, @Body() dto: SendMessageDto) {
     return this.messagesService.send({ userId, ...dto });
@@ -17,32 +29,22 @@ export class MessagesController {
   @Get('channel/:channelId')
   getMessages(
     @CurrentUser('id') userId: string,
-    @Param('channelId') channelId: string,
-    @Query('limit') limit?: string,
-    @Query('cursor') cursor?: string,
-    @Query('mode') mode?: string,
+    @Param('channelId', new ParseUUIDPipe()) channelId: string,
+    @Query() query: GetMessagesQueryDto,
   ) {
-    let parsedLimit = limit ? parseInt(limit, 10) : 50;
-    if (isNaN(parsedLimit) || parsedLimit < 1) parsedLimit = 1;
-    if (parsedLimit > 100) parsedLimit = 100;
-
-    const parsedCursor = cursor != null && cursor !== '' ? parseInt(cursor, 10) : undefined;
-    const parsedMode =
-      mode === 'latest' || mode === 'before' || mode === 'since' ? mode : undefined;
-
     return this.messagesService.getMessages(
       channelId,
       userId,
-      parsedLimit,
-      parsedCursor !== undefined && !isNaN(parsedCursor) ? parsedCursor : undefined,
-      parsedMode,
+      query.limit ?? 50,
+      query.cursor,
+      query.mode,
     );
   }
 
   @Delete(':messageId')
   deleteMessage(
     @CurrentUser('id') userId: string,
-    @Param('messageId') messageId: string,
+    @Param('messageId', new ParseUUIDPipe()) messageId: string,
   ) {
     return this.messagesService.deleteMessage(userId, messageId);
   }

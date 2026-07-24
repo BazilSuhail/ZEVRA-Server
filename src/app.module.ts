@@ -1,7 +1,6 @@
-import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
-import { MulterModule } from '@nestjs/platform-express';
 import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { RedisModule } from './redis/redis.module';
@@ -20,32 +19,36 @@ import { SocketModule } from './socket/socket.module';
 import { ChatModule } from './chat/chat.module';
 import { CallsModule } from './modules/calls/calls.module';
 import { LivekitModule } from './modules/livekit/livekit.module';
-import { AppController } from './app.controller';
 import { HealthController } from './health.controller';
 import { RequestIdMiddleware } from './common/request-id.middleware';
+import { RedisRateLimiter } from './common/rate-limit/redis-rate-limiter';
+import { RedisThrottlerStorage } from './common/rate-limit/redis-throttler.storage';
+import { AppThrottlerGuard } from './common/guards/app-throttler.guard';
+import { getAccessTokenTtl } from './common/config';
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([
-      { name: 'default', ttl: 60000, limit: 1000000 },
-      { name: 'auth', ttl: 60000, limit: 1000000 },
-      { name: 'register', ttl: 300000, limit: 1000000 },
-    ]),
-    MulterModule.register({
-      storage: undefined, // use memory storage (buffer)
-      limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-    }),
     DatabaseModule,
     RedisModule,
+    CommonModule,
+    ThrottlerModule.forRootAsync({
+      inject: [RedisRateLimiter],
+      useFactory: (limiter: RedisRateLimiter) => ({
+        throttlers: [{ name: 'default', ttl: 60_000, limit: Number(process.env.API_RATE_LIMIT_PER_MIN) || 300 }],
+        storage: new RedisThrottlerStorage(limiter),
+      }),
+    }),
     SharedModule,
-    JwtModule.register({
+    JwtModule.registerAsync({
       global: true,
-      secret: process.env.JWT_SECRET,
-      signOptions: { expiresIn: '10h' }, // originally 15m, increased for dev
+      useFactory: () => ({
+        secret: process.env.JWT_SECRET,
+        signOptions: { expiresIn: getAccessTokenTtl(), algorithm: 'HS256' },
+        verifyOptions: { algorithms: ['HS256'] },
+      }),
     }),
     AuthModule,
     UsersModule,
-    CommonModule,
     MessagesModule,
     ChannelsModule,
     KeysModule,
@@ -58,13 +61,11 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
     CallsModule,
     LivekitModule,
   ],
-  controllers: [AppController, HealthController],
-  providers: [
-    { provide: APP_GUARD, useClass: ThrottlerGuard },
-  ],
+  controllers: [HealthController],
+  providers: [{ provide: APP_GUARD, useClass: AppThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(RequestIdMiddleware).forRoutes('*');
+    consumer.apply(RequestIdMiddleware).forRoutes('{*splat}');
   }
 }

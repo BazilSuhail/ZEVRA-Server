@@ -1,16 +1,3 @@
-import { IsString, IsNotEmpty, MaxLength } from 'class-validator';
+import { ReactionDto } from './add-reaction.dto';
 
-export class RemoveReactionDto {
-  @IsString()
-  @IsNotEmpty()
-  channelId!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  messageId!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(8)
-  emoji!: string;
-}
+export class RemoveReactionDto extends ReactionDto {}
